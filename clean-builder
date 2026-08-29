@@ -1,0 +1,737 @@
+#!/usr/bin/env bash
+# clean-builder — an offline Node build container that logs every internet
+# attempt, pointable at any vite/npm project.
+#
+#   ./clean-builder create                    one-time: network + ACL + container
+#                                             (node/npm installed in a logged window)
+#   ./clean-builder provision <project-dir>   install deps WITH internet — logged
+#   ./clean-builder build     <project-dir> [script]
+#                                             npm run <script> (default: build), NO internet
+#   ./clean-builder watch     <project-dir> [script]   dev server, NO internet
+#   ./clean-builder analyze                   AI review of the logs (OpenRouter)
+#   ./clean-builder proxy add <port> <ip:port>  reach a local API during watch
+#   ./clean-builder proxy remove <port>
+#   ./clean-builder start | stop                 run / stop the builder by hand
+#   ./clean-builder dashboard                    at-a-glance status of all projects
+#   ./clean-builder lockdown | logs | status | destroy
+#
+# After each build, the project tree is diffed (host-side) to flag writes OUTSIDE
+# the build output (source/node_modules tampering) and suspicious patterns in the
+# output — a per-project changeset-*.md plus a STATUS.md dashboard. CB_NO_SCAN=1
+# skips it. Phases auto-stop the container when done (frees memory + kills any
+# lingering build process); ~30s cold start next time. CB_KEEP_RUNNING=1 keeps it up.
+#
+# The design (proven on the ProxyLax portal builder):
+#   • The container KEEPS its default route so every internet attempt becomes
+#     a real packet at the bridge, where the Incus ACL decides AND logs it.
+#   • Lockdown (the resting state): only DHCP leaves; the network's logged
+#     default-reject records everything else. provision/create switch to a
+#     temporary profile (DNS 1.1.1.1 + TCP 80/443, still logged) and always
+#     switch back, even on failure.
+#   • build/watch refuse to run unless the ACL is in lockdown (exactly one
+#     egress rule). Offline runs also set npm_config_offline and
+#     COREPACK_ENABLE_NETWORK=0 so honest tools fail fast.
+#   • Every project gets its own folder under ./logs — HOST-ONLY, never mounted
+#     into the container so a build can't tamper with its own evidence: phase
+#     transcripts, per-phase egress captures, and a per-process "who tried to
+#     connect" report. That report comes from strace running as root (the build
+#     is dropped to uid 1000), writing to a root-only container dir pulled out
+#     per phase. `analyze` sends the logs to an OpenRouter model with a triage
+#     rubric — cron-able for daily review.
+#
+# Package managers: pnpm-lock.yaml → pnpm (corepack), yarn.lock → yarn
+# (corepack), otherwise npm (`npm ci`; a missing package-lock.json is
+# generated during provision with lifecycle scripts disabled).
+set -Eeuo pipefail
+
+HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+
+INSTANCE="${CB_INSTANCE:-clean-builder}"
+IMAGE="${CB_IMAGE:-images:ubuntu/26.04}"
+NETWORK="${CB_NETWORK:-cb0}"
+NETWORK_CIDR="10.23.23.1/24"
+GATEWAY="10.23.23.1"
+ACL="${CB_ACL:-clean-builder-egress}"
+LOG_ROOT="${CB_LOG_DIR:-$HERE/logs}"
+case "$LOG_ROOT" in /*) ;; *) LOG_ROOT="$PWD/$LOG_ROOT" ;; esac  # incus disk sources must be absolute
+CB_CINTERNAL="/var/log/cb-internal"   # root-only dir INSIDE the container for live
+                                      # strace traces; never mounted, so the build
+                                      # user (uid 1000) cannot forge or erase them
+DEV_PORT="${CB_PORT:-5173}"
+# DEV_PORT is spliced into an in-container shell command — validate it hard.
+# The ingress ACL only opens 5170-5179, so a port outside that is unreachable.
+case "$DEV_PORT" in ''|*[!0-9]*) echo "error: CB_PORT must be numeric (got: $DEV_PORT)" >&2; exit 2 ;; esac
+{ [ "$DEV_PORT" -ge 5170 ] && [ "$DEV_PORT" -le 5179 ]; } \
+  || { echo "error: CB_PORT must be in 5170-5179 (got: $DEV_PORT)" >&2; exit 2; }
+
+LOCK_FILE="${XDG_RUNTIME_DIR:-${TMPDIR:-/tmp}}/clean-builder-${INSTANCE}.lock"
+
+stamp() { date +%Y%m%d-%H%M%S; }
+die() { echo "error: $*" >&2; exit 1; }
+rel() { printf '%s\n' "${1/#"$LOG_ROOT"/logs}"; }
+
+# One phase at a time. build/watch/provision/create/lockdown/destroy all mutate
+# the single shared ACL + container, so serialize them — this closes the TOCTOU
+# where a provision (which opens the bridge) could start mid-build. The lock is
+# held for the whole phase; `watch` holds it for the dev-server session, so
+# other phases wait behind it. Released automatically when the process exits.
+acquire_lock() {
+  exec 9>"$LOCK_FILE" 2>/dev/null || die "cannot open lock file: $LOCK_FILE"
+  if ! flock -n 9; then
+    echo "▶ another clean-builder phase holds the lock — waiting…" >&2
+    flock 9 || die "could not acquire lock: $LOCK_FILE"
+  fi
+}
+# Labels and folder names end up in file paths, trap strings, and container
+# commands — allow only filename-safe characters.
+sanitize() { printf '%s\n' "${1//[^A-Za-z0-9._-]/-}"; }
+
+# ---------------------------------------------------------------- projects --
+PROJECT=""        # absolute host path
+PROJECT_NAME=""   # basename, used in log file names
+
+resolve_project() {
+  [ -n "${1:-}" ] || die "this action needs a project directory"
+  PROJECT="$(cd "$1" 2>/dev/null && pwd)" || die "no such directory: $1"
+  [ -f "$PROJECT/package.json" ] || die "$PROJECT has no package.json"
+  # basename + short path hash: same-named projects in different places get
+  # distinct log folders (the folder's project-path file records the full path)
+  PROJECT_NAME="$(sanitize "$(basename "$PROJECT")")-$(printf '%s' "$PROJECT" | sha256sum | cut -c1-8)"
+}
+
+# Every project logs into its own folder; builder-level work (toolchain
+# installs) goes to logs/builder.
+log_dir() { echo "$LOG_ROOT/${PROJECT_NAME:-builder}"; }
+
+ensure_log_dir() { # create the phase's log folder, record whose it is, echo it
+  local dir; dir="$(log_dir)"
+  mkdir -p "$dir"
+  [ -z "$PROJECT" ] || printf '%s\n' "$PROJECT" > "$dir/project-path"
+  echo "$dir"
+}
+
+package_manager() {
+  if   [ -f "$PROJECT/pnpm-lock.yaml" ]; then echo pnpm
+  elif [ -f "$PROJECT/yarn.lock" ];      then echo yarn
+  else echo npm; fi
+}
+
+# Mount the chosen project at /work/project (reconciled on every run, so one
+# container serves any number of projects).
+mount_project() {
+  local current
+  current="$(incus config device get "$INSTANCE" project source 2>/dev/null || true)"
+  if [ "$current" != "$PROJECT" ]; then
+    [ -n "$current" ] && incus config device remove "$INSTANCE" project
+    incus config device add "$INSTANCE" project disk source="$PROJECT" path=/work/project shift=true
+  fi
+}
+
+# ------------------------------------------------------------------- runner --
+# Traced runner. strace runs as ROOT and writes the trace into a root-only
+# container dir the build cannot touch; the build itself is dropped to uid 1000
+# with setpriv, so the audited code can neither forge nor erase its own trace.
+# strace records every network syscall plus process lifecycle, so each attempt
+# maps back to the exact command that made it; analyze/net_report.py renders it.
+run_traced() { # <network_flag> <label> <command string>
+  local network_flag="$1" label="$2" cmd="$3"
+  local ctrace="$CB_CINTERNAL/net-$label.trace"
+  # --seccomp-bpf: only the filtered syscalls trap to strace; without it every
+  # syscall of the whole build takes ptrace stops (multi-x slowdown).
+  # Positional args ($1=dir $2=trace $3=cmd) avoid nested-quote hazards.
+  incus exec "$INSTANCE" \
+    --env HOME=/home/builder \
+    --env COREPACK_HOME=/home/builder/.corepack \
+    --env COREPACK_DEFAULT_TO_LATEST=0 \
+    --env COREPACK_ENABLE_NETWORK="$network_flag" \
+    --env npm_config_offline="$([ "$network_flag" = 0 ] && echo true || echo false)" \
+    --env npm_config_logs_dir=/home/builder/.cache/cb-npm \
+    --env npm_config_update_notifier=false \
+    --env NO_UPDATE_NOTIFIER=1 \
+    -- sh -c '
+      mkdir -p "$1" && chmod 700 "$1"
+      exec strace -f -qq -s 300 --seccomp-bpf -e trace=%net,%process -o "$2" \
+        setpriv --reuid=1000 --regid=1000 --init-groups bash -c "$3"
+    ' _ "$CB_CINTERNAL" "$ctrace" "$cmd"
+}
+
+report_net() { # <label> — pull the root-owned trace out, render it, discard it
+  local label="$1" dir; dir="$(log_dir)"
+  local ctrace="$CB_CINTERNAL/net-$label.trace"
+  local trace="$dir/net-$label.trace" file="$dir/net-$label-$(stamp).log"
+  # Pull into host-only ./logs (never container-visible), then delete the
+  # in-container original. No trace (e.g. an untraced toolchain phase) = nothing.
+  incus file pull "$INSTANCE$ctrace" "$trace" 2>/dev/null || { incus exec "$INSTANCE" -- rm -f "$ctrace" 2>/dev/null || true; return 0; }
+  incus exec "$INSTANCE" -- rm -f "$ctrace" 2>/dev/null || true
+  [ -f "$trace" ] || return 0
+  if python3 "$HERE/analyze/net_report.py" "$trace" --label "$label" --out "$file"; then
+    rm -f "$trace"
+    echo "▶ net report: $(rel "$file")"
+  else
+    echo "▲ net report failed — raw trace kept: $(rel "$trace")" >&2
+  fi
+}
+
+# The one teardown every phase shares. Register it on EXIT only and funnel
+# signals through `trap 'exit' INT TERM` — registering the same handler on
+# EXIT *and* INT fires it twice on Ctrl-C (INT trap, then set -e's exit).
+finish_phase() { # <label> [egress-dir]
+  capture_egress "$1" "${2:-}"
+  report_net "$1"
+}
+
+# Stop the container when a phase is done (default): frees its memory when idle
+# AND kills any process a build left running (a double-forked daemon can't
+# survive to the next phase). build runs once → stop; provision runs → stop;
+# watch runs until you quit → stop. The toolchain/node install persists in the
+# container rootfs, so the next phase just restarts it (~30s cold start on a
+# slow host). Set CB_KEEP_RUNNING=1 to leave it up for rapid iteration.
+stop_instance() {
+  [ "${CB_KEEP_RUNNING:-0}" = 1 ] && return 0
+  # force-stop is safe and fast here: the phase is done and all evidence was
+  # already captured host-side (nothing in the container is left to flush).
+  incus stop "$INSTANCE" --force 2>/dev/null || true
+  echo "▶ builder stopped (idle — 0 memory; CB_KEEP_RUNNING=1 to keep it up)"
+}
+
+# End-of-phase teardown for the top-level phases (NOT the toolchain window,
+# whose caller still needs the container up): capture + report, then stop.
+end_phase() { finish_phase "$@"; stop_instance; }
+
+kill_watchers() { incus exec "$INSTANCE" -- pkill -u 1000 -f "vite|node" 2>/dev/null || true; }
+
+# Proxy devices are host-side tunnels that bypass the bridge ACL entirely (and
+# show up as loopback in the strace report), so a leftover one from a past
+# `watch` would be an unlogged escape during an offline `build`. Clear them
+# before any pure-offline build. (`watch` uses them by design — a documented,
+# logged-exempt exception, see proxy_cmd and the README security notes.)
+remove_proxy_devices() {
+  local d removed=""
+  while IFS= read -r d; do
+    [ -n "$d" ] || continue
+    incus config device remove "$INSTANCE" "$d" >/dev/null 2>&1 && removed="$removed $d"
+  done < <(incus config device list "$INSTANCE" 2>/dev/null | grep '^proxy' || true)
+  [ -z "$removed" ] || echo "▶ cleared proxy device(s) before offline build:$removed"
+}
+
+# The egress log — the one evidence source the container cannot forge — is read
+# from the host kernel ring buffer. If we can't read it, captures would be
+# silently empty and a real breach would look clean, so refuse rather than lie.
+assert_dmesg_readable() {
+  dmesg >/dev/null 2>&1 && return 0
+  die "cannot read the kernel log (dmesg) — egress capture would be silently
+       empty, so a real network breach would look clean. Refusing to run.
+       Fix: run as a user permitted to read dmesg, or on the host:
+         sudo sysctl kernel.dmesg_restrict=0"
+}
+
+# ------------------------------------------------------------ ACL profiles --
+read -r -d '' ACL_INGRESS <<EOF || true
+ingress:
+  - action: allow
+    source: $GATEWAY
+    protocol: udp
+    source_port: "67"
+    destination_port: "68"
+    state: enabled
+    description: DHCP replies
+  - action: allow
+    protocol: tcp
+    destination_port: "5170-5179"
+    state: enabled
+    description: dev servers for watch
+EOF
+
+acl_lockdown() {
+  # Restoring lockdown is the most safety-critical operation. It retries and
+  # shouts a CRITICAL warning if it never succeeds, returning non-zero. Callers
+  # that must still capture evidence afterwards invoke it as `acl_lockdown ||
+  # true`, because `set -e` DOES abort a failing command inside an EXIT trap and
+  # would otherwise skip the teardown that follows.
+  local _try
+  for _try in 1 2 3; do
+    if incus network acl edit "$ACL" <<EOF
+config: {}
+description: clean-builder LOCKDOWN — only DHCP leaves; every other packet is rejected and logged
+egress:
+  - action: allow
+    destination: $GATEWAY
+    protocol: udp
+    source_port: "68"
+    destination_port: "67"
+    state: enabled
+    description: DHCP to the isolated bridge
+$ACL_INGRESS
+EOF
+    then
+      echo "▶ internet OFF (lockdown — attempts are rejected and logged)"
+      return 0
+    fi
+    sleep 0.5
+  done
+  echo "▲ CRITICAL: could not restore lockdown on ACL $ACL — the network may be OPEN. Run: ./clean-builder lockdown" >&2
+  return 1
+}
+
+acl_open() {
+  incus network acl edit "$ACL" <<EOF
+config: {}
+description: clean-builder PROVISION — DNS and HTTP(S) allowed and logged
+egress:
+  - action: allow
+    destination: $GATEWAY
+    protocol: udp
+    source_port: "68"
+    destination_port: "67"
+    state: enabled
+    description: DHCP to the isolated bridge
+  - action: reject
+    destination: 10.0.0.0/8,100.64.0.0/10,127.0.0.0/8,169.254.0.0/16,172.16.0.0/12,192.168.0.0/16
+    state: logged
+    description: host, containers, and private networks are never reachable
+  - action: allow
+    destination: 1.1.1.1,1.0.0.1
+    protocol: udp
+    destination_port: "53"
+    state: logged
+    description: DNS while provisioning
+  - action: allow
+    destination: 1.1.1.1,1.0.0.1
+    protocol: tcp
+    destination_port: "53"
+    state: logged
+    description: large DNS replies while provisioning
+  - action: allow
+    protocol: tcp
+    destination_port: "80,443"
+    state: logged
+    description: dependency downloads while provisioning
+$ACL_INGRESS
+EOF
+  echo "▶ internet ON (provision — every connection is logged)"
+}
+
+assert_lockdown() {
+  # The real enforcement is the NETWORK default egress action + logging (set by
+  # ensure_network). VERIFY it here with one fast read — do NOT re-set it: an
+  # `incus network set` triggers a firewall reload (slow on busy hosts) on every
+  # run. Detecting drift and refusing is enough; we don't need to re-apply it.
+  local net_cfg
+  net_cfg="$(incus network show "$NETWORK" 2>/dev/null || true)"
+  printf '%s\n' "$net_cfg" | grep -q 'security.acls.default.egress.action: *reject' \
+    || die "network $NETWORK default egress is not 'reject' — refusing (run: ./clean-builder create)"
+  printf '%s\n' "$net_cfg" | grep -Eq 'security.acls.default.egress.logged: *"?true"?' \
+    || die "network $NETWORK egress logging is off — evidence would be lost, refusing (run: ./clean-builder create)"
+
+  # The ACL must be in lockdown: exactly one egress rule, and it must be the
+  # benign DHCP allow — not a wildcard `allow` that also counts as one rule.
+  local egress_block n
+  egress_block="$(incus network acl show "$ACL" | awk '/^egress:/{e=1;next}/^ingress:/{e=0}e{print}')"
+  n="$(printf '%s\n' "$egress_block" | grep -c '^  - action:')"
+  if [ "$n" != "1" ]; then
+    echo "error: ACL $ACL is not in lockdown ($n egress rules) — refusing to run offline work" >&2
+    echo "       run: ./clean-builder lockdown" >&2
+    exit 1
+  fi
+  printf '%s\n' "$egress_block" | grep -q 'destination_port: "67"' \
+    || die "ACL $ACL's single egress rule is not the DHCP allow — refusing (run: ./clean-builder lockdown)"
+}
+
+# ------------------------------------------------------------- egress log --
+EGRESS_MARK=0
+egress_entries() { dmesg 2>/dev/null | grep -F "${NETWORK}-" || true; }
+mark_egress() { assert_dmesg_readable; EGRESS_MARK="$(egress_entries | wc -l)"; }
+
+capture_egress() {
+  local label="$1" dir="${2:-$(log_dir)}"
+  mkdir -p "$dir"
+  local file="$dir/egress-$label-$(stamp).log"
+  local now; now="$(egress_entries | wc -l)"
+  {
+    echo "# Egress packets during '$label' (host kernel log, ACL $ACL)"
+    echo "# '${NETWORK}-egress' without a rule number = default REJECT (nothing should appear during offline phases)"
+    if [ "$now" -lt "$EGRESS_MARK" ]; then
+      # The kernel ring buffer wrapped since the phase started, so the line-count
+      # window is invalid. Over-report (dump every current line) rather than
+      # silently drop evidence, and flag it loudly — never let a breach look clean.
+      echo "# WARNING: kernel ring buffer shrank during this phase (${EGRESS_MARK}→${now} lines)."
+      echo "#          Showing ALL current ${NETWORK}- lines; may include earlier phases or have lost some."
+      egress_entries
+    else
+      egress_entries | tail -n +"$((EGRESS_MARK + 1))"
+    fi
+  } > "$file"
+  # count real packet lines only — exclude the '#' header/warning lines, which
+  # themselves mention "${NETWORK}-egress" and would otherwise be miscounted.
+  local count; count="$(grep -F "${NETWORK}-" "$file" 2>/dev/null | grep -cv '^#' || true)"
+  echo "▶ egress log: $(rel "$file")  (${count:-0} packets)"
+  [ "$now" -lt "$EGRESS_MARK" ] && echo "▲ egress capture for '$label' may be incomplete — kernel log wrapped; review it by hand" >&2 || true
+}
+
+# -------------------------------------------------- output integrity (L1+L2) --
+# After an offline build, compare the project tree before/after (host-side, so a
+# build can't forge it) and flag anything a clean build would never do: writing
+# OUTSIDE the build-output dirs (source/config/node_modules tampering), or
+# shipping output that contains high-signal patterns (exfil / eval / drainers).
+CB_OUTPUT_DIRS="dist build .svelte-kit .next out .vite .cache .astro .turbo .output coverage storybook-static public/build node_modules/.vite node_modules/.cache"
+
+snapshot_tree() { # <outfile> — sha256 of the project tree (excl node_modules/.git)
+  ( cd "$PROJECT" && find . \( -name node_modules -o -name .git \) -prune -o -type f -print0 2>/dev/null \
+      | xargs -0 sha256sum 2>/dev/null | sort -k2 ) > "$1" 2>/dev/null || true
+}
+
+is_expected_path() { # <relpath> → 0 if under an expected build-output dir
+  local p="${1#./}" d
+  for d in $CB_OUTPUT_DIRS; do case "$p" in "$d"/*|"$d") return 0;; esac; done
+  return 1
+}
+
+scan_file() { # <abspath> <relpath> — echo "category|count|example" for pattern hits
+  local f="$1" rel="$2" cat pat n ex entry
+  case "$rel" in *.js|*.mjs|*.cjs|*.ts|*.jsx|*.tsx|*.html|*.htm|*.css|*.json|*.svg|*.vue|*.svelte) ;; *) return 0;; esac
+  local -a cats=(
+    "net-call|navigator\\.sendBeacon|new WebSocket|\\.onion"
+    "hardcoded-ip|https?://[0-9]{1,3}(\\.[0-9]{1,3}){3}"
+    "dynamic-exec|eval\\(|new Function\\(|atob\\("
+    "secret-access|document\\.cookie|localStorage|process\\.env|navigator\\.clipboard"
+    "wallet-drainer|privateKey|mnemonic|seedPhrase|window\\.ethereum|walletConnect"
+  )
+  for entry in "${cats[@]}"; do
+    cat="${entry%%|*}"; pat="${entry#*|}"
+    n="$(grep -aEoc "$pat" "$f" 2>/dev/null || true)"; n="${n:-0}"
+    [ "$n" -gt 0 ] || continue
+    ex="$(grep -aEo "$pat" "$f" 2>/dev/null | head -1 | cut -c1-80)"
+    printf '%s|%s|%s\n' "$cat" "$n" "$ex"
+  done
+}
+
+analyze_changeset() { # <label> <pre-snapshot> <report-md> → echo "VERDICT|unexpected|hits"
+  local label="$1" pre="$2" report="$3"
+  local post; post="$(mktemp "${TMPDIR:-/tmp}/cb-post.XXXXXX")"
+  snapshot_tree "$post"
+  local changes; changes="$(awk '
+    function h(s){return substr(s,1,64)} function p(s){return substr(s,67)}
+    NR==FNR { pre[p($0)]=h($0); next }
+    { po[p($0)]=1; if (!(p($0) in pre)) print "A\t" p($0); else if (pre[p($0)]!=h($0)) print "M\t" p($0) }
+    END { for (k in pre) if (!(k in po)) print "D\t" k }
+  ' "$pre" "$post")"
+  rm -f "$post"
+
+  # node_modules (pruned from the hash snapshot) must not change during an offline
+  # build except caches — best-effort mtime tripwire (a build could backdate it).
+  local nm_changed=0
+  if [ -d "$PROJECT/node_modules" ]; then
+    nm_changed="$(find "$PROJECT/node_modules" -newer "$pre" -type f \
+      -not -path '*/.vite/*' -not -path '*/.cache/*' -not -name '.package-lock.json' 2>/dev/null | wc -l)"
+    nm_changed="${nm_changed:-0}"
+  fi
+
+  local unexpected=0 expected=0 hits=0 unexpected_list="" scan_out="" st rel hit
+  while IFS=$'\t' read -r st rel; do
+    [ -n "${rel:-}" ] || continue
+    if is_expected_path "$rel"; then
+      expected=$((expected+1))
+      if [ "$st" != "D" ] && [ -f "$PROJECT/$rel" ]; then
+        while IFS= read -r hit; do
+          [ -n "$hit" ] || continue
+          hits=$((hits+1))
+          scan_out="$scan_out
+- \`$rel\` — **${hit%%|*}** ×$(echo "$hit" | cut -d'|' -f2): \`$(echo "$hit" | cut -d'|' -f3-)\`"
+        done < <(scan_file "$PROJECT/$rel" "$rel")
+      fi
+    else
+      unexpected=$((unexpected+1))
+      unexpected_list="$unexpected_list
+- \`$st\` \`$rel\`"
+    fi
+  done <<< "$changes"
+
+  if [ "$nm_changed" -gt 0 ]; then
+    unexpected=$((unexpected + nm_changed))
+    unexpected_list="$unexpected_list
+- \`node_modules\` — $nm_changed file(s) modified during the offline build (best-effort mtime check)"
+  fi
+
+  local verdict icon
+  if   [ "$unexpected" -gt 0 ]; then verdict="ISSUE";  icon="✗"
+  elif [ "$hits" -gt 0 ];       then verdict="REVIEW"; icon="▲"
+  else verdict="CLEAN"; icon="✓"; fi
+  {
+    printf '<!-- cb verdict=%s unexpected=%s hits=%s built=%s -->\n' "$verdict" "$unexpected" "$hits" "$(date '+%Y-%m-%dT%H:%M')"
+    echo "# Output changeset — '$label' — $icon $verdict"
+    echo "_$(date '+%Y-%m-%d %H:%M')_  ·  expected-output changes: $expected  ·  **unexpected: $unexpected**  ·  scan hits: $hits"
+    if [ "$unexpected" -gt 0 ]; then
+      echo; echo "## ✗ Changed OUTSIDE build output — review now"
+      echo "A clean build only writes to: \`$CB_OUTPUT_DIRS\`"
+      echo "$unexpected_list"
+    fi
+    if [ "$hits" -gt 0 ]; then
+      echo; echo "## ▲ Suspicious patterns in build output — needs eyes"
+      echo "(minified bundles can trip these; compare against a trusted build)"
+      echo "$scan_out"
+    fi
+    [ "$unexpected" = 0 ] && [ "$hits" = 0 ] && { echo; echo "Only expected build-output files changed, no suspicious patterns. ✓"; } || true
+  } > "$report"
+  echo "$verdict|$unexpected|$hits"
+}
+
+scan_output() { # <label> <pre-snapshot> — write changeset, print verdict, refresh dashboard
+  local label="$1" pre="$2" dir; dir="$(log_dir)"
+  local report="$dir/changeset-$label-$(stamp).md"
+  local res; res="$(analyze_changeset "$label" "$pre" "$report")"
+  rm -f "$pre"
+  local verdict="${res%%|*}" u h; u="$(echo "$res" | cut -d'|' -f2)"; h="$(echo "$res" | cut -d'|' -f3)"
+  case "$verdict" in
+    ISSUE)  echo "✗ OUTPUT CHANGESET: ISSUE — $u change(s) outside build output → $(rel "$report")" >&2 ;;
+    REVIEW) echo "▲ output changeset: REVIEW — $h suspicious pattern(s) in output → $(rel "$report")" ;;
+    *)      echo "✓ output changeset: clean (only build output changed)" ;;
+  esac
+  update_dashboard
+}
+
+update_dashboard() { # regenerate $LOG_ROOT/STATUS.md from the newest changeset per project
+  local out="$LOG_ROOT/STATUS.md" proj latest line v u h b icon
+  {
+    echo "# clean-builder — status"
+    echo "_updated $(date '+%Y-%m-%d %H:%M')_"
+    echo
+    echo "| project | last build | verdict | unexpected writes | scan hits |"
+    echo "|---|---|---|---|---|"
+    for proj in "$LOG_ROOT"/*/; do
+      [ -d "$proj" ] || continue
+      latest="$(ls -t "$proj"changeset-*.md 2>/dev/null | head -1)"
+      [ -n "$latest" ] || continue
+      line="$(head -1 "$latest")"
+      case "$line" in *'cb verdict='*) ;; *) continue ;; esac
+      v="$(sed -n 's/.*verdict=\([A-Z]*\).*/\1/p' <<<"$line")"
+      u="$(sed -n 's/.*unexpected=\([0-9]*\).*/\1/p' <<<"$line")"
+      h="$(sed -n 's/.*hits=\([0-9]*\).*/\1/p' <<<"$line")"
+      b="$(sed -n 's/.*built=\([0-9T:-]*\).*/\1/p' <<<"$line")"
+      case "$v" in ISSUE) icon="✗ ISSUE";; REVIEW) icon="▲ REVIEW";; CLEAN) icon="✓ clean";; *) icon="${v:-?}";; esac
+      echo "| $(basename "$proj") | ${b:-?} | $icon | ${u:-0} | ${h:-0} |"
+    done
+    echo
+    echo "> ✓ clean = only build-output files changed · ▲ REVIEW = suspicious patterns in output · ✗ ISSUE = files changed outside build output (likely tampering)"
+  } > "$out"
+}
+
+# ------------------------------------------------------------------ setup --
+ensure_network() {
+  if ! incus network show "$NETWORK" >/dev/null 2>&1; then
+    incus network create "$NETWORK" ipv4.address="$NETWORK_CIDR" ipv4.nat=true ipv6.address=none
+  fi
+  incus network acl show "$ACL" >/dev/null 2>&1 || incus network acl create "$ACL"
+  acl_lockdown >/dev/null
+  incus network set "$NETWORK" \
+    security.acls="$ACL" \
+    security.acls.default.ingress.action=reject \
+    security.acls.default.egress.action=reject \
+    security.acls.default.ingress.logged=true \
+    security.acls.default.egress.logged=true
+}
+
+ensure_instance() {
+  if ! incus info "$INSTANCE" >/dev/null 2>&1; then
+    incus create "$IMAGE" "$INSTANCE" \
+      -c limits.cpu="${CB_CPU:-2}" -c limits.memory="${CB_MEMORY:-2GiB}" -c limits.processes=512 \
+      -c boot.autostart=false \
+      -c raw.idmap="both $(id -u) 1000" \
+      --network "$NETWORK"
+  fi
+  incus start "$INSTANCE" 2>/dev/null || true
+  local _i
+  for _i in $(seq 1 40); do incus exec "$INSTANCE" -- true 2>/dev/null && break; sleep 0.5; done
+
+  mkdir -p "$LOG_ROOT"
+  # ./logs is HOST-ONLY: it is deliberately never mounted into the container, so
+  # a build cannot tamper with its own trace or overwrite earlier evidence.
+  # Remove any legacy logs mount from an older version, then create the
+  # root-only internal dir where live strace traces land (pulled out per phase).
+  incus config device get "$INSTANCE" logs source >/dev/null 2>&1 \
+    && incus config device remove "$INSTANCE" logs >/dev/null 2>&1 || true
+  incus exec "$INSTANCE" -- sh -c "mkdir -p '$CB_CINTERNAL' && chmod 700 '$CB_CINTERNAL'"
+
+  # Builder user (uid 1000 maps to you on the mounts). Ubuntu images ship a
+  # stock uid-1000 "ubuntu" user — rename it.
+  incus exec "$INSTANCE" -- sh -c '
+    if ! id builder >/dev/null 2>&1; then
+      existing="$(getent passwd 1000 | cut -d: -f1)"
+      if [ -n "$existing" ]; then
+        usermod -l builder -d /home/builder -m "$existing"
+        groupmod -n builder "$(getent group 1000 | cut -d: -f1)" 2>/dev/null || true
+      else
+        groupadd -g 1000 builder; useradd -m -u 1000 -g 1000 -s /bin/bash builder
+      fi
+    fi'
+
+  # Default route STAYS (the ACL is the enforcement point); public resolver
+  # stays so DNS attempts emit loggable packets.
+  incus exec "$INSTANCE" -- sh -c 'ip -4 route show default | grep -q . || ip -4 route replace default via '"$GATEWAY"' dev eth0 onlink'
+  incus exec "$INSTANCE" -- sh -c 'rm -f /etc/resolv.conf && printf "nameserver 1.1.1.1\nnameserver 1.0.0.1\n" > /etc/resolv.conf'
+
+  # Toolchain, once, in a logged provision window.
+  if ! incus exec "$INSTANCE" -- sh -c 'test -x /usr/bin/node && test -x /usr/bin/strace'; then
+    echo "▶ installing node/npm/corepack/strace inside the container (logged window)…"
+    mark_egress
+    acl_open
+    trap 'exit' INT TERM
+    trap 'acl_lockdown || true; finish_phase toolchain "$LOG_ROOT/builder"' EXIT
+    incus exec "$INSTANCE" -- apt-get update
+    incus exec "$INSTANCE" -- env DEBIAN_FRONTEND=noninteractive apt-get install -y nodejs npm strace
+    incus exec "$INSTANCE" -- sh -c 'command -v corepack >/dev/null || npm install -g corepack --no-audit --no-fund; corepack --version'
+    trap - EXIT INT TERM
+    acl_lockdown || true
+    finish_phase toolchain "$LOG_ROOT/builder"
+    incus exec "$INSTANCE" -- sh -c 'echo "node $(node --version) · npm $(npm --version)"'
+  fi
+}
+
+# ------------------------------------------------------------------ phases --
+provision() {
+  resolve_project "${1:-}"
+  ensure_network
+  ensure_instance
+  mount_project
+  local pm dir; pm="$(package_manager)"; dir="$(ensure_log_dir)"
+  local file="$dir/install-$(stamp).log"
+  echo "▶ provisioning '$PROJECT_NAME' with $pm — transcript → $(rel "$file")"
+  mark_egress
+  acl_open
+  trap 'exit' INT TERM
+  trap 'acl_lockdown || true; end_phase install' EXIT
+  local cmd
+  case "$pm" in
+    pnpm) cmd='cd /work/project && corepack enable --install-directory /home/builder/.local/bin 2>/dev/null; export PATH=/home/builder/.local/bin:$PATH
+       corepack prepare pnpm@latest --activate 2>/dev/null || true
+       CI=true corepack pnpm install --frozen-lockfile' ;;
+    yarn) cmd='cd /work/project && corepack prepare yarn@stable --activate 2>/dev/null || true
+       CI=true corepack yarn install --immutable' ;;
+    npm)  cmd='cd /work/project
+       [ -f package-lock.json ] || npm install --package-lock-only --ignore-scripts --no-audit --no-fund
+       npm ci --no-audit --no-fund' ;;
+  esac
+  run_traced 1 install "$cmd" 2>&1 | tee "$file"
+  trap - EXIT INT TERM
+  acl_lockdown || true
+  end_phase install
+  echo "✓ install finished — builder is offline again"
+}
+
+pm_run() { # <script> — run a package.json script with the right manager
+  local script pm; script="$(printf '%q' "$1")"; pm="$(package_manager)"
+  case "$pm" in
+    pnpm) echo "corepack pnpm run $script" ;;
+    yarn) echo "corepack yarn run $script" ;;
+    npm)  echo "npm run $script" ;;
+  esac
+}
+
+build() {
+  resolve_project "${1:-}"
+  local script="${2:-build}" label
+  label="$(sanitize "$script")"
+  # only real online phases may carry these labels — the analyzer's rubric
+  # treats every other label as offline-must-be-silent
+  case "$label" in install|toolchain) label="offline-$label" ;; esac
+  ensure_instance
+  remove_proxy_devices
+  mount_project
+  assert_lockdown
+  local dir; dir="$(ensure_log_dir)"
+  local file="$dir/$label-$(stamp).log"
+  echo "▶ offline '$script' of '$PROJECT_NAME' — transcript → $(rel "$file")"
+  # Layer 1+2: snapshot the project tree before the build so we can tell exactly
+  # what it wrote afterwards (host-side; CB_NO_SCAN=1 skips it for huge repos).
+  local pre=""
+  [ "${CB_NO_SCAN:-0}" = 1 ] || { pre="$(mktemp "${TMPDIR:-/tmp}/cb-pre.XXXXXX")"; snapshot_tree "$pre"; }
+  mark_egress
+  trap 'exit' INT TERM
+  trap 'end_phase "$label"' EXIT
+  run_traced 0 "$label" "cd /work/project && $(pm_run "$script")" 2>&1 | tee "$file"
+  trap - EXIT INT TERM
+  end_phase "$label"
+  [ -n "$pre" ] && scan_output "$label" "$pre" || true
+  echo "✓ build finished (offline)"
+}
+
+watch() {
+  resolve_project "${1:-}"
+  local script="${2:-}"
+  ensure_instance
+  mount_project
+  assert_lockdown
+  local ip
+  ip="$(incus list "$INSTANCE" --format csv -c 4 | awk '{print $1}' | head -1)"
+  if [ -n "$script" ]; then
+    echo "▶ offline '$script' of '$PROJECT_NAME' (builder: $ip)"
+  else
+    echo "▶ offline watch of '$PROJECT_NAME' — http://${ip}:${DEV_PORT}"
+  fi
+  echo "  Press q + Enter (or Ctrl-C) to stop."
+  kill_watchers
+  mark_egress
+  trap 'true' INT
+  trap 'exit' TERM
+  trap 'kill_watchers; end_phase watch' EXIT
+  local cmd
+  if [ -n "$script" ]; then
+    # explicit project script (e.g. a sass/esbuild watcher), no port wiring
+    cmd="exec $(pm_run "$script")"
+  else
+    # vite runs directly (no npm lifecycle wrapper): quiet exits, q works.
+    cmd="if [ -x node_modules/.bin/vite ]; then exec node_modules/.bin/vite --host 0.0.0.0 --port $DEV_PORT; else exec $(pm_run dev) -- --host 0.0.0.0 --port $DEV_PORT; fi"
+  fi
+  ensure_log_dir >/dev/null
+  run_traced 0 watch "cd /work/project && $cmd" || true
+  trap - EXIT INT TERM
+  echo
+  kill_watchers
+  end_phase watch
+  echo "✓ watch closed"
+}
+
+# ------------------------------------------------------------------- misc --
+proxy_cmd() {
+  case "${1:-}" in
+    add)
+      [ -n "${2:-}" ] && [ -n "${3:-}" ] || die "usage: proxy add <port> <ip:port>"
+      incus config device add "$INSTANCE" "proxy$2" proxy bind=instance \
+        listen="tcp:127.0.0.1:$2" connect="tcp:$3" 2>/dev/null \
+        || incus config device set "$INSTANCE" "proxy$2" connect="tcp:$3"
+      echo "✓ 127.0.0.1:$2 inside the builder now reaches $3 (via the host, not the network)"
+      ;;
+    remove)
+      [ -n "${2:-}" ] || die "usage: proxy remove <port>"
+      incus config device remove "$INSTANCE" "proxy$2"
+      echo "✓ proxy on port $2 removed"
+      ;;
+    *) die "usage: proxy add <port> <ip:port> | proxy remove <port>" ;;
+  esac
+}
+
+status() {
+  incus list "$INSTANCE" --format table -c ns4mD || true
+  echo "ACL egress rules ($ACL):"
+  incus network acl show "$ACL" | awk '/^egress:/{e=1;next}/^ingress:/{e=0}e&&/description:/{print "  -", $2, $3, $4, $5, $6}'
+  echo "project mount: $(incus config device get "$INSTANCE" project source 2>/dev/null || echo '(none)')"
+}
+
+case "${1:-}" in
+  create)    acquire_lock; ensure_network; ensure_instance; assert_lockdown; echo "✓ builder ready (offline)";;
+  provision) acquire_lock; provision "${2:-}" ;;
+  build)     acquire_lock; build "${2:-}" "${3:-}" ;;
+  watch)     acquire_lock; watch "${2:-}" "${3:-}" ;;
+  analyze)   shift; exec python3 "$HERE/analyze/analyze_logs.py" --logs "$LOG_ROOT" "$@" ;;
+  proxy)     shift; proxy_cmd "$@" ;;
+  lockdown)  acquire_lock; acl_lockdown ;;
+  logs)      echo "# folder: $LOG_ROOT (one subfolder per project)"
+             find "$LOG_ROOT" -type f \( -name '*.log' -o -name '*.md' -o -name '*.trace' \) -printf '%T@ %P\n' 2>/dev/null \
+               | sort -rn | head -20 | cut -d' ' -f2- | grep -v '^README' || true
+             echo "# live kernel entries:"; egress_entries | tail -10 ;;
+  status)    status ;;
+  dashboard) update_dashboard; echo "▶ dashboard: $(rel "$LOG_ROOT/STATUS.md")"; command -v glow >/dev/null && glow "$LOG_ROOT/STATUS.md" || cat "$LOG_ROOT/STATUS.md" ;;
+  start)     acquire_lock; incus start "$INSTANCE" 2>/dev/null && echo "✓ builder running" || die "cannot start '$INSTANCE' — run: ./clean-builder create" ;;
+  stop)      acquire_lock; CB_KEEP_RUNNING=0 stop_instance ;;
+  destroy)   acquire_lock; incus delete "$INSTANCE" --force; echo "✓ container removed (network + ACL kept)";;
+  *) sed -n '4,22p' "$0"; exit 2 ;;
+esac

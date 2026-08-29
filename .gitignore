@@ -1,0 +1,23 @@
+logs/*
+!logs/README.md
+node_modules/
+dist/
+example/package-lock.json
+__pycache__/
+
+# AI assistant tooling / local editor state — never published
+.claude/
+.claude.json
+CLAUDE.md
+CLAUDE.local.md
+.cursor/
+.cursorrules
+.cursorignore
+.aider*
+.continue/
+.windsurf/
+.roo/
+.codeium/
+.github/copilot-instructions.md
+.vscode/
+.idea/
