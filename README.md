@@ -398,11 +398,12 @@ provision profiles), at the cost of:
 Estimated at roughly a day of careful work, most of it testing the firewall
 toggling. Until then: Incus is the supported backend.
 
-## Tested with
+## Choosing a model for `analyze`
 
-The `analyze` step is model-agnostic — any OpenRouter model works. The triage
-rubric is being validated against Claude Opus 4.8, GLM 5.3, OpenAI SOL (~5.6),
-and Grok 4.6. Exact model versions are still to be re-verified.
+The `analyze` step is model-agnostic — any OpenRouter model works. It defaults
+to `anthropic/claude-sonnet-4.5`; pick another with `--model` or
+`CB_ANALYZE_MODEL`. Results from validating the triage rubric across models
+will be published here.
 
 ## Contributing
 
