@@ -1,0 +1,27 @@
+# Keeps the CI actions and the example project current. The cooldown waits a
+# week before proposing a newly published version, so a compromised release has
+# time to be caught and pulled first — the same supply-chain caution
+# clean-builder is built around. (Security updates are not delayed.)
+version: 2
+updates:
+  - package-ecosystem: github-actions
+    directory: /
+    schedule:
+      interval: weekly
+    cooldown:
+      default-days: 7
+    groups:
+      github-actions:
+        patterns:
+          - "*"
+    commit-message:
+      prefix: ci
+
+  - package-ecosystem: npm
+    directory: /example
+    schedule:
+      interval: monthly
+    cooldown:
+      default-days: 7
+    commit-message:
+      prefix: example
