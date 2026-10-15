@@ -1,0 +1,6 @@
+# ShellCheck settings for clean-builder (CI: shellcheck --severity=warning clean-builder)
+#
+# SC2155 "declare and assign separately": every `local x="...$(stamp)..."` in
+# the script substitutes a `date` timestamp, which cannot fail, so there is no
+# exit status worth preserving.
+disable=SC2155

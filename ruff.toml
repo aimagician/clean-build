@@ -1,0 +1,8 @@
+# Ruff settings for the standard-library-only helpers (CI: ruff check analyze/ tests/)
+target-version = "py39"
+
+[lint]
+ignore = [
+  "DTZ005",  # timestamps are deliberately local time: they are read by people
+  "EXE001",  # analyze/net_report.py is run via `python3`, not executed directly
+]

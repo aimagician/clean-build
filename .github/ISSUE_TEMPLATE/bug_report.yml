@@ -1,0 +1,52 @@
+name: Bug report
+description: Something in clean-builder doesn't work as documented.
+labels: ["bug"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thanks for taking the time to report this.
+
+        **Security problems don't belong here.** If a build can reach the network, forge or erase evidence, or get around the lockdown, please [report it privately](https://github.com/aimagician/clean-build/security/advisories/new) instead.
+  - type: textarea
+    id: what-happened
+    attributes:
+      label: What happened?
+      description: What you ran, what you expected, and what happened instead.
+    validations:
+      required: true
+  - type: textarea
+    id: steps
+    attributes:
+      label: Steps to reproduce
+      placeholder: |
+        1. ./clean-builder create
+        2. ./clean-builder provision example
+        3. ./clean-builder build example
+    validations:
+      required: true
+  - type: textarea
+    id: output
+    attributes:
+      label: Relevant output or log excerpt
+      description: Terminal output or lines from `logs/<project>/…`. Review it first — transcripts can contain host paths, tokens or private registry URLs.
+      render: text
+  - type: input
+    id: version
+    attributes:
+      label: clean-builder version
+      description: A release tag, or the output of `git rev-parse --short HEAD`.
+      placeholder: v0.1.0
+    validations:
+      required: true
+  - type: textarea
+    id: environment
+    attributes:
+      label: Environment
+      value: |
+        - Distribution and kernel (`uname -sr`):
+        - Incus (`incus version`):
+        - Python (`python3 --version`):
+        - The project's package manager (npm / pnpm / yarn):
+    validations:
+      required: true

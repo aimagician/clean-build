@@ -5,6 +5,16 @@ dist/
 example/package-lock.json
 __pycache__/
 
+# Local secrets — e.g. an OPENROUTER_API_KEY kept in a .env file
+.env
+.env.*
+!.env.example
+
+# OS / editor droppings
+.DS_Store
+*.swp
+*~
+
 # AI assistant tooling / local editor state — never published
 .claude/
 .claude.json

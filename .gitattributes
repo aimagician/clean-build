@@ -1,0 +1,4 @@
+# Check out text files with LF endings everywhere. clean-builder is a Bash
+# script and breaks with CRLF (e.g. a clone made on Windows and run in WSL).
+* text=auto eol=lf
+clean-builder text eol=lf

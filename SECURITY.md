@@ -61,15 +61,25 @@ build — by hostname (the DNS path) and by raw IP (no DNS). Both must be blocke
 It exits non-zero if either path reaches the network, so you can wire it into
 CI as a regression check.
 
+## Supported versions
+
+Security fixes land on `main` and ship in the next release. Please reproduce
+on the latest release or on `main` before reporting.
+
+| version | supported |
+|---|---|
+| latest release | ✅ |
+| `main` | ✅ |
+| older releases | ❌ |
+
 ## Reporting a vulnerability
 
 Please report security issues **privately** — do **not** open a public issue
-for a vulnerability.
+or pull request for a vulnerability.
 
-- **Preferred:** use GitHub's private vulnerability reporting on this
-  repository — the **Security** tab → **Report a vulnerability**.
-  (Enable it under *Settings → Code security and analysis → Private
-  vulnerability reporting* if it is not already on.)
+- **Preferred:** GitHub's private vulnerability reporting —
+  **[Report a vulnerability](https://github.com/aimagician/clean-build/security/advisories/new)**
+  (also reachable from the repository's **Security** tab).
 - Include the affected version or commit, a description of the issue, and
   ideally a minimal reproduction — for example, a project that demonstrates the
   bypass.
@@ -77,3 +87,9 @@ for a vulnerability.
 You can expect an acknowledgement of your report. Confirmed issues will be
 prioritized; please allow a reasonable window for a fix before public
 disclosure.
+
+### Forks
+
+This policy covers this repository. If you use a fork, report problems in the
+fork's own changes to its maintainer — and if the issue also affects this
+repository, report it here as well.
