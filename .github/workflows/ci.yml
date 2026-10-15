@@ -1,0 +1,43 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+# Least privilege: the jobs only read the repository.
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  checks:
+    name: Lint and test
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - name: Check out
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803  # v6.1.0
+        with:
+          persist-credentials: false
+
+      - name: Bash — syntax and ShellCheck
+        run: |
+          bash -n clean-builder
+          pipx run --spec shellcheck-py==0.11.0.1 shellcheck --severity=warning clean-builder
+
+      - name: Python — syntax and Ruff
+        run: |
+          python3 -m py_compile analyze/*.py tests/*.py
+          pipx run --spec ruff==0.16.8 ruff check analyze/ tests/
+
+      - name: Python — unit tests (no Incus, no network)
+        run: python3 -m unittest discover -s tests -v
+
+      - name: JavaScript — syntax of the example project
+        run: |
+          for f in example/*.js example/*.mjs; do node --check "$f"; done
