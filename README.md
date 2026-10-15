@@ -1,5 +1,9 @@
 # clean-builder
 
+[![CI](https://github.com/aimagician/clean-build/actions/workflows/ci.yml/badge.svg)](https://github.com/aimagician/clean-build/actions/workflows/ci.yml)
+[![Latest release](https://img.shields.io/github/v/release/aimagician/clean-build?sort=semver)](https://github.com/aimagician/clean-build/releases)
+[![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
+
 An offline Node build container that **logs every internet attempt** — point
 it at any vite/npm project.
 
@@ -13,11 +17,32 @@ server leaking telemetry.
 
 ## Requirements
 
+- A **Linux host** (bash, coreutils, util-linux).
 - **[Incus](https://linuxcontainers.org/incus/)** with a working `images:`
   remote (this is the enforcement engine — see [Why Incus](#future-work-a-docker-backend)).
-- **`python3`** on the host (standard library only — nothing to `pip install`).
+- **`python3`** 3.9 or newer on the host (standard library only — nothing to
+  `pip install`).
 - Run as a **normal user** with `incus` access — never as root.
+- **Kernel log access.** Egress evidence is read with `dmesg`, so your user
+  must be allowed to read it. Many distributions restrict that
+  (`kernel.dmesg_restrict=1`); clean-builder then refuses to run rather than
+  produce silently empty evidence. Lifting the restriction
+  (`sudo sysctl kernel.dmesg_restrict=0`) lets every local user read the
+  kernel log — on a shared machine, weigh that first.
 - An **OpenRouter API key** only if you use the optional `analyze` step.
+
+## Install
+
+```bash
+git clone https://github.com/aimagician/clean-build.git ~/clean-build
+cd ~/clean-build
+```
+
+That's all: `clean-builder` is a single Bash script, and the helpers in
+`analyze/` use only the Python standard library. To run a fixed, reviewed
+version instead of whatever `main` holds today, check out a
+[release](https://github.com/aimagician/clean-build/releases) tag
+(`git checkout v0.1.0`) — release tags are immutable.
 
 ## Quick start
 
@@ -50,7 +75,7 @@ into your shell config so you can call it from anywhere as `cb`:
 
 ```bash
 # ~/.bashrc  (or ~/.zshrc)
-export CB_HOME="$HOME/clean-builder"        # where you cloned this repo
+export CB_HOME="$HOME/clean-build"          # where you cloned this repo
 cb() { "$CB_HOME/clean-builder" "$@"; }
 ```
 
@@ -240,7 +265,7 @@ Offline means your dev server can't call a backend on another container
 either. Instead of opening the network, forward through the host:
 
 ```bash
-./clean-builder proxy add 8801 10.10.10.170:8801
+./clean-builder proxy add 8801 10.0.0.5:8801     # <port> <backend-ip>:<port>
 ```
 
 Now `127.0.0.1:8801` *inside* the builder reaches that backend via an Incus
@@ -315,17 +340,45 @@ phase just restarts the container (~30 s cold start on a slow host). For rapid
 back-to-back builds, set `CB_KEEP_RUNNING=1` to leave it up, or `./clean-builder
 stop` / `start` by hand.
 
-Tunables (env): `CB_INSTANCE`, `CB_IMAGE`, `CB_NETWORK`, `CB_PORT` (dev
-server port, default 5173, must be in the ingress-allowed range 5170-5179),
-`CB_CPU`, `CB_MEMORY`, `CB_KEEP_RUNNING` (`1` = don't auto-stop),
-`CB_ANALYZE_MODEL`, `CB_APP_URL` (OpenRouter attribution URL). Set these
-yourself; `CB_PORT` is validated because it is passed into an in-container
-command.
+Tunables (environment variables — set them yourself; `CB_PORT` is validated
+because it is passed into an in-container command):
+
+| variable | default | what it does |
+|---|---|---|
+| `CB_INSTANCE` | `clean-builder` | Incus container name (also names the phase lock) |
+| `CB_IMAGE` | `images:ubuntu/26.04` | image the builder is created from |
+| `CB_NETWORK` | `cb0` | isolated bridge the ACL is attached to |
+| `CB_ACL` | `clean-builder-egress` | name of the Incus network ACL |
+| `CB_LOG_DIR` | `logs/` next to the script | host-only log folder — never put it inside a project you build, since the project is mounted into the container |
+| `CB_PORT` | `5173` | dev-server port for `watch`; must be in the ingress-allowed range 5170-5179 |
+| `CB_CPU` / `CB_MEMORY` | `2` / `2GiB` | container limits, applied when `create` first makes the container |
+| `CB_KEEP_RUNNING` | `0` | `1` = don't stop the container after each phase |
+| `CB_NO_SCAN` | `0` | `1` = skip the output-integrity diff (very large repos) |
+| `CB_ANALYZE_MODEL` | `anthropic/claude-sonnet-4.5` | OpenRouter model used by `analyze` |
+| `CB_APP_URL` | this repository's URL | attribution URL `analyze` sends to OpenRouter |
+| `OPENROUTER_API_KEY` | — | needed only for `analyze` |
 
 > **Why it stays safe even during provision:** Incus evaluates ACL rules as
 > **reject-over-allow, regardless of order**, so the private-range reject always
 > wins over the broad `80/443` allow — your host and other containers stay
 > unreachable even while the internet window is open.
+
+## Forking & customizing
+
+Forks are welcome — it's MIT-licensed, and nothing in the repository is tied to
+one machine. If you run or publish a fork:
+
+- **Pin what you run.** Use a release tag or a commit you have reviewed, not a
+  moving branch: this tool exists to contain code you don't trust, so treat its
+  own updates the same way.
+- **Set `CB_APP_URL`** to your fork's URL — `analyze` sends it to OpenRouter as
+  the attribution header, and it defaults to this repository.
+- **Check the bridge subnet.** `cb0` uses `10.23.23.0/24` (`NETWORK_CIDR` and
+  `GATEWAY` near the top of `clean-builder`); change both if that overlaps a
+  network you already use.
+- **Publishing your fork?** Point the vulnerability-report links in
+  `SECURITY.md` and `.github/ISSUE_TEMPLATE/config.yml` at your repository so
+  reports reach you, and update `.github/CODEOWNERS`.
 
 ## Future work: a Docker backend
 
@@ -350,6 +403,19 @@ toggling. Until then: Incus is the supported backend.
 The `analyze` step is model-agnostic — any OpenRouter model works. The triage
 rubric is being validated against Claude Opus 4.8, GLM 5.3, OpenAI SOL (~5.6),
 and Grok 4.6. Exact model versions are still to be re-verified.
+
+## Contributing
+
+Bug reports, new detection patterns, docs fixes and tests are all welcome —
+start with [CONTRIBUTING.md](CONTRIBUTING.md), and please follow the
+[Code of Conduct](CODE_OF_CONDUCT.md). Notable changes are listed in
+[CHANGELOG.md](CHANGELOG.md).
+
+## Reporting a vulnerability
+
+Found a way for a build to reach the network, forge or erase evidence, or slip
+past the lockdown? Please report it **privately** as described in
+[SECURITY.md](SECURITY.md) — not in a public issue.
 
 ## License
 
