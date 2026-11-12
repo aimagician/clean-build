@@ -44,6 +44,9 @@ and how to report a vulnerability.
   the isolated bridge, the project mount, `watch`'s proxy tunnels). A NIC or
   mount added by hand, `raw.lxc` or privileged mode would otherwise route
   around the egress log or the output check without a trace.
+- **The output allowlist is host-side.** A project's own output paths
+  (`./clean-builder outputs`) are kept in its host-only log folder, so a
+  build can't add to the paths the output check skips.
 - **Evidence integrity.** `./logs` is host-only and never mounted into the
   container. The `strace` trace is written by root to a root-only container
   directory (the build itself runs dropped to uid 1000) and pulled out per

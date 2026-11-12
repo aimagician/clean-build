@@ -8,6 +8,8 @@
 #   ./clean-builder build     <project-dir> [script]
 #                                             npm run <script> (default: build), NO internet
 #   ./clean-builder watch     <project-dir> [script]   dev server, NO internet
+#   ./clean-builder outputs   <project-dir> [add|remove <path>...]
+#                                             the project's own build-output paths
 #   ./clean-builder analyze                   AI review of the logs (OpenRouter)
 #   ./clean-builder proxy add <port> <ip:port>  reach a local API during watch
 #   ./clean-builder proxy remove <port>
@@ -17,9 +19,11 @@
 #
 # After each build, the project tree is diffed (host-side) to flag writes OUTSIDE
 # the build output (source/node_modules tampering) and suspicious patterns in the
-# output — a per-project changeset-*.md plus a STATUS.md dashboard. CB_NO_SCAN=1
-# skips it. Phases auto-stop the container when done (frees memory + kills any
-# lingering build process); ~30s cold start next time. CB_KEEP_RUNNING=1 keeps it up.
+# output — a per-project changeset-*.md plus a STATUS.md dashboard. A project
+# whose scripts write elsewhere (a Zola site's static/) names those paths with
+# `outputs`; CB_NO_SCAN=1 skips the check. Phases auto-stop the container when
+# done (frees memory + kills any lingering build process); ~30s cold start next
+# time. CB_KEEP_RUNNING=1 keeps it up.
 #
 # The design (proven on the ProxyLax portal builder):
 #   • The container KEEPS its default route so every internet attempt becomes
@@ -450,6 +454,30 @@ capture_egress() {
 # shipping output that contains high-signal patterns (exfil / eval / drainers).
 CB_OUTPUT_DIRS="dist build .svelte-kit .next out .vite .cache .astro .turbo .output coverage storybook-static public/build node_modules/.vite node_modules/.cache"
 
+# Some projects write their output somewhere else: a Zola site's style build
+# writes static/style.css, and a `zola serve` running beside it copies that
+# into public/. `outputs` names such paths per project. The list is kept in the
+# project's log folder, which is host-only and never mounted, so a build can't
+# add to its own list. build reads it before it starts.
+PROJECT_OUTPUTS=""   # this project's own output paths, space-separated
+
+valid_output_path() { # <path> → 0 if it is a plain relative path inside the project
+  local IFS=/ c
+  case "$1" in ''|/*|*/|*[!A-Za-z0-9._/-]*|node_modules|node_modules/*|.git|.git/*) return 1 ;; esac
+  for c in $1; do case "$c" in ''|.|..) return 1 ;; esac; done
+}
+
+load_outputs() { # PROJECT_OUTPUTS ← the project's outputs file, one path per line
+  PROJECT_OUTPUTS=""
+  local f p n=0; f="$(log_dir)/outputs"
+  [ -f "$f" ] || return 0
+  while IFS= read -r p || [ -n "$p" ]; do
+    n=$((n + 1)); [ -n "$p" ] || continue
+    valid_output_path "$p" || die "$(rel "$f"), line $n: not a relative path inside the project: $p"
+    PROJECT_OUTPUTS="${PROJECT_OUTPUTS:+$PROJECT_OUTPUTS }$p"
+  done < "$f"
+}
+
 snapshot_tree() { # <outfile> — sha256 of the project tree (excl node_modules/.git)
   ( cd "$PROJECT" && find . \( -name node_modules -o -name .git \) -prune -o -type f -print0 2>/dev/null \
       | xargs -0 sha256sum 2>/dev/null | sort -k2 ) > "$1" 2>/dev/null || true
@@ -457,7 +485,7 @@ snapshot_tree() { # <outfile> — sha256 of the project tree (excl node_modules/
 
 is_expected_path() { # <relpath> → 0 if under an expected build-output dir
   local p="${1#./}" d
-  for d in $CB_OUTPUT_DIRS; do case "$p" in "$d"/*|"$d") return 0;; esac; done
+  for d in $CB_OUTPUT_DIRS $PROJECT_OUTPUTS; do case "$p" in "$d"/*|"$d") return 0;; esac; done
   return 1
 }
 
@@ -535,10 +563,13 @@ analyze_changeset() { # <label> <pre-snapshot> <report-md> → echo "VERDICT|une
     printf '<!-- cb verdict=%s unexpected=%s hits=%s built=%s -->\n' "$verdict" "$unexpected" "$hits" "$(date '+%Y-%m-%dT%H:%M')"
     echo "# Output changeset — '$label' — $icon $verdict"
     echo "_$(date '+%Y-%m-%d %H:%M')_  ·  expected-output changes: $expected  ·  **unexpected: $unexpected**  ·  scan hits: $hits"
+    [ -z "$PROJECT_OUTPUTS" ] || echo "_Also build output for this project (\`./clean-builder outputs\`): \`$PROJECT_OUTPUTS\`_"
     if [ "$unexpected" -gt 0 ]; then
       echo; echo "## ✗ Changed OUTSIDE build output — review now"
-      echo "A clean build only writes to: \`$CB_OUTPUT_DIRS\`"
+      echo "A clean build only writes to: \`$CB_OUTPUT_DIRS${PROJECT_OUTPUTS:+ $PROJECT_OUTPUTS}\`"
       echo "$unexpected_list"
+      echo
+      echo "If you have checked that the project's own scripts write these on purpose, \`./clean-builder outputs <project-dir> add <path>...\` makes later builds count them as output."
     fi
     if [ "$hits" -gt 0 ]; then
       echo; echo "## ▲ Suspicious patterns in build output — needs eyes"
@@ -574,7 +605,9 @@ update_dashboard() { # regenerate $LOG_ROOT/STATUS.md from the newest changeset 
     echo "|---|---|---|---|---|"
     for proj in "$LOG_ROOT"/*/; do
       [ -d "$proj" ] || continue
-      latest="$(ls -t "$proj"changeset-*.md 2>/dev/null | head -1)"
+      # A folder with no build yet (logs/builder, an install-only project)
+      # makes ls fail; without `|| true`, set -e would end the script here.
+      latest="$(ls -t "$proj"changeset-*.md 2>/dev/null | head -1)" || true
       [ -n "$latest" ] || continue
       line="$(head -1 "$latest")"
       case "$line" in *'cb verdict='*) ;; *) continue ;; esac
@@ -587,7 +620,8 @@ update_dashboard() { # regenerate $LOG_ROOT/STATUS.md from the newest changeset 
     done
     echo
     echo "> ✓ clean = only build-output files changed · ▲ REVIEW = suspicious patterns in output · ✗ ISSUE = files changed outside build output (likely tampering)"
-  } > "$out"
+  } > "$out.tmp"
+  mv -f "$out.tmp" "$out"   # a run that fails halfway leaves the last good dashboard
 }
 
 # ------------------------------------------------------------------ setup --
@@ -728,6 +762,7 @@ pm_run() { # <script> — run a package.json script with the right manager
 
 build() {
   resolve_project "${1:-}"
+  load_outputs
   local script="${2:-build}" label
   label="$(sanitize "$script")"
   # only real online phases may carry these labels — the analyzer's rubric
@@ -740,6 +775,7 @@ build() {
   local dir; dir="$(ensure_log_dir)"
   local file="$dir/$label-$(stamp).log"
   echo "▶ offline '$script' of '$PROJECT_NAME' — transcript → $(rel "$file")"
+  [ -z "$PROJECT_OUTPUTS" ] || echo "▶ also counted as build output for this project: $PROJECT_OUTPUTS"
   # Layer 1+2: snapshot the project tree before the build so we can tell exactly
   # what it wrote afterwards (host-side; CB_NO_SCAN=1 skips it for huge repos).
   local pre=""
@@ -809,6 +845,38 @@ proxy_cmd() {
   esac
 }
 
+outputs_cmd() { # <project-dir> [add|remove <path>...] — the project's own output paths
+  resolve_project "${1:-}"; shift
+  load_outputs
+  local verb="${1:-}" p f list=" $PROJECT_OUTPUTS "
+  case "$verb" in
+    "") ;;
+    add|remove)
+      shift
+      [ "$#" -gt 0 ] || die "usage: outputs <project-dir> $verb <path>..."
+      for p in "$@"; do
+        case "$p" in "$PROJECT"/*) p="${p#"$PROJECT"/}" ;; esac
+        p="${p#./}"; p="${p%/}"
+        valid_output_path "$p" \
+          || die "not a path inside the project: $p (relative; letters, digits, . _ - /; no '..'; not node_modules or .git)"
+        list="${list// "$p" / }"
+        [ "$verb" = remove ] || list="$list$p "
+      done
+      f="$(ensure_log_dir)/outputs"
+      if [ -n "${list// /}" ]; then
+        printf '%s\n' $list > "$f.tmp" && mv -f "$f.tmp" "$f"
+      else
+        rm -f "$f"
+      fi
+      load_outputs
+      ;;
+    *) die "usage: outputs <project-dir> [add|remove <path>...]" ;;
+  esac
+  echo "build output of $PROJECT_NAME:"
+  echo "  every project:     $CB_OUTPUT_DIRS"
+  echo "  this project only: ${PROJECT_OUTPUTS:-(nothing more)}"
+}
+
 status() {
   incus list "$INSTANCE" --format table -c ns4mD || true
   echo "ACL egress rules ($ACL):"
@@ -829,6 +897,7 @@ case "${1:-}" in
   watch)     acquire_lock; watch "${2:-}" "${3:-}" ;;
   analyze)   shift; exec python3 "$HERE/analyze/analyze_logs.py" --logs "$LOG_ROOT" "$@" ;;
   proxy)     shift; proxy_cmd "$@" ;;
+  outputs)   shift; outputs_cmd "$@" ;;
   lockdown)  acquire_lock; acl_lockdown ;;
   logs)      echo "# folder: $LOG_ROOT (one subfolder per project)"
              find "$LOG_ROOT" -type f \( -name '*.log' -o -name '*.md' -o -name '*.trace' \) -printf '%T@ %P\n' 2>/dev/null \
@@ -840,5 +909,5 @@ case "${1:-}" in
              start_instance; echo "✓ builder running" ;;
   stop)      acquire_lock; CB_KEEP_RUNNING=0 stop_instance ;;
   destroy)   acquire_lock; incus delete "$INSTANCE" --force; echo "✓ container removed (network + ACL kept)";;
-  *) sed -n '4,22p' "$0"; exit 2 ;;
+  *) sed -n '4,26p' "$0"; exit 2 ;;
 esac

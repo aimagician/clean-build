@@ -150,6 +150,7 @@ full host path; builder-level work like the toolchain install goes to
 | `egress-<phase>-<stamp>.log` | every packet that left during that phase |
 | `net-<phase>-<stamp>.log` | **who** tried to connect: per-process report of every network syscall (strace), naming the exact command behind each attempt |
 | `analysis-<stamp>.md` | saved AI verdicts |
+| `outputs` | the project's own output paths, if it has any (`./clean-builder outputs`) |
 
 Egress lines come from the host kernel log (nftables):
 
@@ -192,6 +193,25 @@ Each build writes a `changeset-<stamp>.md` to its log folder with the verdict
 (`✓ CLEAN` / `▲ REVIEW` / `✗ ISSUE`) and the exact files/patterns, and the
 terminal prints a one-line verdict. `CB_NO_SCAN=1` skips the diff for very large
 repos.
+
+### A project's own output paths
+
+Some projects write their output somewhere else. A Zola site's style build
+writes `static/style.css`, and a `zola serve` running beside it copies that
+into `public/`. Every such build would be an **ISSUE**, which teaches you to
+skip the verdict. Name those paths once, for that project:
+
+```bash
+./clean-builder outputs ../mysite add website/static/style.css website/public
+./clean-builder outputs ../mysite                         # list them
+./clean-builder outputs ../mysite remove website/public
+```
+
+Writes there then count as build output for that project only: they're
+scanned like `dist/`, and each changeset lists the extra paths. The list lives
+in the project's log folder (`logs/<project>/outputs`), which is host-only, so
+a build can't add to its own list. Name only paths you've checked the
+project's own scripts write on purpose: writes there are no longer flagged.
 
 ### At-a-glance dashboard
 
@@ -349,6 +369,7 @@ Known limitations:
 ```bash
 ./clean-builder status      # container, ACL profile, project mount, side-door check
 ./clean-builder dashboard   # at-a-glance output-integrity status of all projects
+./clean-builder outputs <dir> [add|remove <path>...]   # a project's own output paths
 ./clean-builder logs        # newest files + live kernel entries
 ./clean-builder lockdown    # force the resting ACL by hand
 ./clean-builder start       # start the builder by hand
