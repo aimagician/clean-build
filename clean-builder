@@ -30,7 +30,8 @@
 #     switch back, even on failure.
 #   • build/watch refuse to run unless the ACL is in lockdown (exactly one
 #     egress rule). Offline runs also set npm_config_offline and
-#     COREPACK_ENABLE_NETWORK=0 so honest tools fail fast.
+#     COREPACK_ENABLE_NETWORK=0 so honest tools fail fast, and every run
+#     turns off pnpm 11's install-before-`pnpm run`.
 #   • Every project gets its own folder under ./logs — HOST-ONLY, never mounted
 #     into the container so a build can't tamper with its own evidence: phase
 #     transcripts, per-phase egress captures, and a per-process "who tried to
@@ -63,6 +64,10 @@ DEV_PORT="${CB_PORT:-5173}"
 case "$DEV_PORT" in ''|*[!0-9]*) echo "error: CB_PORT must be numeric (got: $DEV_PORT)" >&2; exit 2 ;; esac
 { [ "$DEV_PORT" -ge 5170 ] && [ "$DEV_PORT" -le 5179 ]; } \
   || { echo "error: CB_PORT must be in 5170-5179 (got: $DEV_PORT)" >&2; exit 2; }
+# corepack from npm, not Ubuntu's (see ensure_instance). 0.35+ needs Node
+# ≥22.22.2; Ubuntu 26.04 ships 22.22.1. An exact version only: it goes to npm.
+COREPACK_PIN="${CB_COREPACK:-0.34.7}"
+case "$COREPACK_PIN" in ''|*[!0-9.]*) echo "error: CB_COREPACK must be a version like 0.34.7 (got: $COREPACK_PIN)" >&2; exit 2 ;; esac
 
 LOCK_FILE="${XDG_RUNTIME_DIR:-${TMPDIR:-/tmp}}/clean-builder-${INSTANCE}.lock"
 
@@ -139,12 +144,16 @@ run_traced() { # <network_flag> <label> <command string>
   # --seccomp-bpf: only the filtered syscalls trap to strace; without it every
   # syscall of the whole build takes ptrace stops (multi-x slowdown).
   # Positional args ($1=dir $2=trace $3=cmd) avoid nested-quote hazards.
+  # pnpm 11 installs before every `pnpm run` by default (verifyDepsBeforeRun
+  # = install): an offline build would re-link node_modules and dial the
+  # registry. Installs belong to provision only.
   incus exec "$INSTANCE" \
     --env HOME=/home/builder \
     --env COREPACK_HOME=/home/builder/.corepack \
     --env COREPACK_DEFAULT_TO_LATEST=0 \
     --env COREPACK_ENABLE_NETWORK="$network_flag" \
     --env npm_config_offline="$([ "$network_flag" = 0 ] && echo true || echo false)" \
+    --env pnpm_config_verify_deps_before_run=false \
     --env npm_config_logs_dir=/home/builder/.cache/cb-npm \
     --env npm_config_update_notifier=false \
     --env NO_UPDATE_NOTIFIER=1 \
@@ -569,20 +578,30 @@ ensure_instance() {
   incus exec "$INSTANCE" -- sh -c 'ip -4 route show default | grep -q . || ip -4 route replace default via '"$GATEWAY"' dev eth0 onlink'
   incus exec "$INSTANCE" -- sh -c 'rm -f /etc/resolv.conf && printf "nameserver 1.1.1.1\nnameserver 1.0.0.1\n" > /etc/resolv.conf'
 
-  # Toolchain, once, in a logged provision window.
-  if ! incus exec "$INSTANCE" -- sh -c 'test -x /usr/bin/node && test -x /usr/bin/strace'; then
-    echo "▶ installing node/npm/corepack/strace inside the container (logged window)…"
+  # Toolchain, in a logged provision window: node/npm/strace from Ubuntu once,
+  # corepack pinned from npm. Ubuntu's own corepack (0.24 on 26.04) can't
+  # start pnpm 11 — it compiles pnpm's launcher, which uses import(), with
+  # its own loader → ERR_VM_DYNAMIC_IMPORT_CALLBACK_MISSING (fixed in corepack
+  # 0.34.5). npm puts the pin in /usr/local/bin, ahead of /usr/bin on PATH.
+  # Checked on every phase, so an existing container picks up a new pin too.
+  local need_apt=0 need_corepack=0
+  incus exec "$INSTANCE" -- sh -c 'test -x /usr/bin/node && test -x /usr/bin/strace' || need_apt=1
+  [ "$(incus exec "$INSTANCE" -- corepack --version 2>/dev/null || true)" = "$COREPACK_PIN" ] || need_corepack=1
+  if [ "$need_apt" = 1 ] || [ "$need_corepack" = 1 ]; then
+    echo "▶ installing the toolchain inside the container (logged window)…"
     mark_egress
     acl_open
     trap 'exit' INT TERM
     trap 'acl_lockdown || true; finish_phase toolchain "$LOG_ROOT/builder"' EXIT
-    incus exec "$INSTANCE" -- apt-get update
-    incus exec "$INSTANCE" -- env DEBIAN_FRONTEND=noninteractive apt-get install -y nodejs npm strace
-    incus exec "$INSTANCE" -- sh -c 'command -v corepack >/dev/null || npm install -g corepack --no-audit --no-fund; corepack --version'
+    if [ "$need_apt" = 1 ]; then
+      incus exec "$INSTANCE" -- apt-get update
+      incus exec "$INSTANCE" -- env DEBIAN_FRONTEND=noninteractive apt-get install -y nodejs npm strace
+    fi
+    incus exec "$INSTANCE" -- npm install -g "corepack@$COREPACK_PIN" --no-audit --no-fund
     trap - EXIT INT TERM
     acl_lockdown || true
     finish_phase toolchain "$LOG_ROOT/builder"
-    incus exec "$INSTANCE" -- sh -c 'echo "node $(node --version) · npm $(npm --version)"'
+    incus exec "$INSTANCE" -- sh -c 'echo "node $(node --version) · npm $(npm --version) · corepack $(corepack --version) ($(command -v corepack))"'
   fi
 }
 

@@ -121,6 +121,11 @@ Package manager is detected per project: `pnpm-lock.yaml` → pnpm (corepack),
 `package-lock.json` is generated during provision with lifecycle scripts
 disabled).
 
+corepack itself comes from npm, pinned (`CB_COREPACK`, default 0.34.7), not
+from Ubuntu: Ubuntu 26.04's packaged corepack (0.24) cannot start pnpm 11.
+Every phase checks the container's corepack against the pin and, if it
+differs, installs the pin in a logged toolchain window (`logs/builder/`).
+
 ## Logs (`./logs`, host-only — never mounted into the container)
 
 One folder per project, named `<basename>-<8-char path hash>`
