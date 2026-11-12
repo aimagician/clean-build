@@ -107,9 +107,18 @@ decides and logs:
 - **Provision**: a temporary ACL profile additionally allows DNS to
   1.1.1.1/1.0.0.1 and TCP 80/443 — all logged — and is always restored,
   even on failure.
+- Every phase refuses to start the container unless it holds only what the
+  script manages: the root disk, `eth0` on `cb0`, the `project` mount and
+  `watch`'s `proxy<port>` tunnels. A second NIC would be a way out the egress
+  log never sees, and an extra mount a folder every build could change outside
+  the output check. Devices from a profile count, and so do `raw.*` keys
+  (`raw.lxc` can add interfaces and mounts that aren't devices),
+  `security.privileged` and a changed `raw.idmap`. `./clean-builder status`
+  runs the same check without starting anything.
 - `build`/`watch` refuse to start unless the network is actually enforcing:
-  the default egress action is `reject`, egress logging is on, and the ACL
-  holds exactly one egress rule — the DHCP allow. They also set
+  the default egress action is `reject`, egress logging is on, the ACL holds
+  exactly one egress rule — the DHCP allow — and no other ACL is attached to
+  the network (its rules would apply too). They also set
   `npm_config_offline` / `COREPACK_ENABLE_NETWORK=0` so honest tools fail
   fast instead of hanging, and clear any leftover `proxy` device (see below)
   before an offline build.
@@ -303,8 +312,19 @@ What holds well:
   the bridge) can't start mid-`build` and open a window the build could use.
   A second phase waits for the first to finish; `watch` holds the lock for its
   whole session.
+- **No side doors.** The ACL only sees `cb0` and the output check only sees
+  the project folder, so the container may hold nothing else: no second NIC,
+  no extra mount, no `raw.lxc`, no privileged mode. Anything added by hand (or
+  through a profile) stops every phase, with a list of what to undo. A
+  `project` mount whose folder has since been deleted is dropped instead, so it
+  no longer keeps the container from starting.
 
 Known limitations:
+
+- **The side-door check runs when a phase starts.** A device added while a
+  phase runs is caught by the next phase. Changes inside the container's own
+  filesystem (packages or files installed by hand) aren't checked at all; the
+  toolchain belongs in `create`'s logged window.
 
 - **strace attribution is still best-effort.** A build can print misleading
   content to its own transcript, and evade the trace itself (io_uring, argv
@@ -327,7 +347,7 @@ Known limitations:
 ## Other commands & tuning
 
 ```bash
-./clean-builder status      # container, ACL profile, current project mount
+./clean-builder status      # container, ACL profile, project mount, side-door check
 ./clean-builder dashboard   # at-a-glance output-integrity status of all projects
 ./clean-builder logs        # newest files + live kernel entries
 ./clean-builder lockdown    # force the resting ACL by hand

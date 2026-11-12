@@ -36,8 +36,14 @@ and how to report a vulnerability.
 - **Network enforcement** is a host-side Incus bridge ACL with a logged
   default-reject. Container code (running as the build user, uid 1000) cannot
   change it. `build`/`watch` verify the *enforced* properties before running —
-  default-reject on, egress logging on, ACL in lockdown — and refuse to run if
-  the network is not locked down or the kernel egress log is unreadable.
+  default-reject on, egress logging on, ACL in lockdown, no other ACL on the
+  network — and refuse to run if the network is not locked down or the kernel
+  egress log is unreadable.
+- **No side doors.** Every phase refuses to start the container unless its
+  expanded config holds only what the script manages (the root disk, `eth0` on
+  the isolated bridge, the project mount, `watch`'s proxy tunnels). A NIC or
+  mount added by hand, `raw.lxc` or privileged mode would otherwise route
+  around the egress log or the output check without a trace.
 - **Evidence integrity.** `./logs` is host-only and never mounted into the
   container. The `strace` trace is written by root to a root-only container
   directory (the build itself runs dropped to uid 1000) and pulled out per

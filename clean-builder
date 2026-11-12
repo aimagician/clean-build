@@ -32,6 +32,10 @@
 #     egress rule). Offline runs also set npm_config_offline and
 #     COREPACK_ENABLE_NETWORK=0 so honest tools fail fast, and every run
 #     turns off pnpm 11's install-before-`pnpm run`.
+#   • Every phase refuses to start the container unless it holds only what
+#     this script manages: the root disk, eth0 on cb0, the project mount and
+#     watch's proxy<port> tunnels. A NIC or mount added by hand (or through a
+#     profile or raw.lxc) would get around the egress log or the output check.
 #   • Every project gets its own folder under ./logs — HOST-ONLY, never mounted
 #     into the container so a build can't tamper with its own evidence: phase
 #     transcripts, per-phase egress captures, and a per-process "who tried to
@@ -81,7 +85,9 @@ rel() { printf '%s\n' "${1/#"$LOG_ROOT"/logs}"; }
 # held for the whole phase; `watch` holds it for the dev-server session, so
 # other phases wait behind it. Released automatically when the process exits.
 acquire_lock() {
-  exec 9>"$LOCK_FILE" 2>/dev/null || die "cannot open lock file: $LOCK_FILE"
+  # The braces keep 2>/dev/null to this one redirection: on a bare `exec` it
+  # would silence stderr, and with it every error message, for the whole run.
+  { exec 9>"$LOCK_FILE"; } 2>/dev/null || die "cannot open lock file: $LOCK_FILE"
   if ! flock -n 9; then
     echo "▶ another clean-builder phase holds the lock — waiting…" >&2
     flock 9 || die "could not acquire lock: $LOCK_FILE"
@@ -331,6 +337,10 @@ assert_lockdown() {
     || die "network $NETWORK default egress is not 'reject' — refusing (run: ./clean-builder create)"
   printf '%s\n' "$net_cfg" | grep -Eq 'security.acls.default.egress.logged: *"?true"?' \
     || die "network $NETWORK egress logging is off — evidence would be lost, refusing (run: ./clean-builder create)"
+  # Rules from every ACL on the network apply, so a second ACL could allow
+  # what the lockdown rejects.
+  [ "$(printf '%s\n' "$net_cfg" | awk '/^  security\.acls:/ {print $2}')" = "$ACL" ] \
+    || die "network $NETWORK has ACLs besides $ACL, and their rules apply too — refusing (run: ./clean-builder create)"
 
   # The ACL must be in lockdown: exactly one egress rule, and it must be the
   # benign DHCP allow — not a wildcard `allow` that also counts as one rule.
@@ -344,6 +354,62 @@ assert_lockdown() {
   fi
   printf '%s\n' "$egress_block" | grep -q 'destination_port: "67"' \
     || die "ACL $ACL's single egress rule is not the DHCP allow — refusing (run: ./clean-builder lockdown)"
+}
+
+# ------------------------------------------------------- isolation check --
+# The ACL only sees traffic on $NETWORK and the output check only sees
+# $PROJECT, so anything added to the container by hand gets around both without
+# a trace: a second NIC is a way out the egress log never sees, and an extra
+# disk is a folder (or socket) every build can reach outside the output check.
+# The container may hold only what this script manages: the root disk, eth0 on
+# $NETWORK, the project mount, and watch's proxy<port> tunnels (build removes
+# those first). Read from the expanded config, so profile devices count too,
+# as do raw.* keys (raw.lxc can add interfaces and mounts that aren't devices).
+isolation_problems() { # expanded config YAML on stdin → one line per problem
+  awk -v net="$NETWORK" -v idmap="both $(id -u) 1000" '
+    function val(s) { sub(/^ *[^:]*: */, "", s); gsub(/^"|"$/, "", s); return s }
+    /^[^ ]/ { sec = $1; next }
+    sec == "config:" && /^  [^ ]/ {
+      k = $1; sub(/:$/, "", k)
+      if (k ~ /^raw\./ && k != "raw.idmap") print k " is set"
+      if (k == "raw.idmap" && val($0) != idmap) print "raw.idmap is \"" val($0) "\", not \"" idmap "\""
+      if (k == "security.privileged" && val($0) == "true") print "security.privileged is true"
+      next
+    }
+    sec == "devices:" && /^  [^ ]/ { d = $1; sub(/:$/, "", d); devs[++n] = d; next }
+    sec == "devices:" && /^    [^ ]/ {
+      k = $1; sub(/:$/, "", k); dev[d, k] = val($0)
+      if (k ~ /^security\.acls/) acls[d] = 1
+    }
+    END {
+      for (i = 1; i <= n; i++) {
+        d = devs[i]; t = dev[d, "type"]
+        if (t == "none") continue                     # masks a profile device
+        if (d == "root" && t == "disk" && dev[d, "path"] == "/") continue
+        if (d == "project" && t == "disk" && dev[d, "path"] == "/work/project") continue
+        if (d ~ /^proxy[0-9]+$/ && t == "proxy") continue
+        if (d == "eth0" && t == "nic" && dev[d, "network"] == net && !(d in acls)) continue
+        desc = t
+        if (dev[d, "network"] != "") desc = desc " on " dev[d, "network"]
+        if (dev[d, "parent"] != "") desc = desc " on " dev[d, "parent"]
+        if (dev[d, "source"] != "") desc = desc ", " dev[d, "source"]
+        if (dev[d, "path"] != "") desc = desc " at " dev[d, "path"]
+        if (d in acls) desc = desc ", with its own ACLs"
+        print "device " d " (" desc ")"
+      }
+    }'
+}
+
+assert_isolated() {
+  local cfg problems
+  cfg="$(incus config show "$INSTANCE" --expanded)" || die "cannot read the config of $INSTANCE"
+  problems="$(printf '%s\n' "$cfg" | isolation_problems)"
+  [ -n "$problems" ] || return 0
+  die "$INSTANCE has things this script did not set up, so its egress log and
+       output check could miss what a build does. Refusing to start it:
+$(printf '%s\n' "$problems" | sed 's/^/         - /')
+       Undo each one (a device: incus config device remove $INSTANCE <name>,
+       or remove it from the profile it comes from), then run again."
 }
 
 # ------------------------------------------------------------- egress log --
@@ -539,6 +605,23 @@ ensure_network() {
     security.acls.default.egress.logged=true
 }
 
+# Every phase (and `start`) starts the container through here. A project folder
+# deleted since its last run leaves the project mount pointing nowhere, and
+# Incus then won't start the container at all, so that mount goes first
+# (mount_project adds it back for this run). Then the isolation check.
+start_instance() {
+  local src _i
+  src="$(incus config device get "$INSTANCE" project source 2>/dev/null || true)"
+  if [ -n "$src" ] && [ ! -d "$src" ]; then
+    incus config device remove "$INSTANCE" project >/dev/null
+    echo "▶ removed the project mount of a folder that no longer exists: $src"
+  fi
+  assert_isolated
+  incus start "$INSTANCE" 2>/dev/null || true
+  for _i in $(seq 1 40); do incus exec "$INSTANCE" -- true 2>/dev/null && return 0; sleep 0.5; done
+  die "$INSTANCE did not start (run: incus start $INSTANCE, to see why)"
+}
+
 ensure_instance() {
   if ! incus info "$INSTANCE" >/dev/null 2>&1; then
     incus create "$IMAGE" "$INSTANCE" \
@@ -547,9 +630,7 @@ ensure_instance() {
       -c raw.idmap="both $(id -u) 1000" \
       --network "$NETWORK"
   fi
-  incus start "$INSTANCE" 2>/dev/null || true
-  local _i
-  for _i in $(seq 1 40); do incus exec "$INSTANCE" -- true 2>/dev/null && break; sleep 0.5; done
+  start_instance
 
   mkdir -p "$LOG_ROOT"
   # ./logs is HOST-ONLY: it is deliberately never mounted into the container, so
@@ -733,6 +814,12 @@ status() {
   echo "ACL egress rules ($ACL):"
   incus network acl show "$ACL" | awk '/^egress:/{e=1;next}/^ingress:/{e=0}e&&/description:/{print "  -", $2, $3, $4, $5, $6}'
   echo "project mount: $(incus config device get "$INSTANCE" project source 2>/dev/null || echo '(none)')"
+  local cfg problems
+  if cfg="$(incus config show "$INSTANCE" --expanded 2>/dev/null)"; then
+    problems="$(printf '%s\n' "$cfg" | isolation_problems)"
+    if [ -z "$problems" ]; then echo "isolation: ok (only the devices this script manages)"
+    else echo "isolation: every phase will refuse to start the builder:"; printf '%s\n' "$problems" | sed 's/^/  - /'; fi
+  fi
 }
 
 case "${1:-}" in
@@ -749,7 +836,8 @@ case "${1:-}" in
              echo "# live kernel entries:"; egress_entries | tail -10 ;;
   status)    status ;;
   dashboard) update_dashboard; echo "▶ dashboard: $(rel "$LOG_ROOT/STATUS.md")"; command -v glow >/dev/null && glow "$LOG_ROOT/STATUS.md" || cat "$LOG_ROOT/STATUS.md" ;;
-  start)     acquire_lock; incus start "$INSTANCE" 2>/dev/null && echo "✓ builder running" || die "cannot start '$INSTANCE' — run: ./clean-builder create" ;;
+  start)     acquire_lock; incus info "$INSTANCE" >/dev/null 2>&1 || die "no '$INSTANCE' yet — run: ./clean-builder create"
+             start_instance; echo "✓ builder running" ;;
   stop)      acquire_lock; CB_KEEP_RUNNING=0 stop_instance ;;
   destroy)   acquire_lock; incus delete "$INSTANCE" --force; echo "✓ container removed (network + ACL kept)";;
   *) sed -n '4,22p' "$0"; exit 2 ;;
