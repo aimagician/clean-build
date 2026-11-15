@@ -31,3 +31,6 @@ CLAUDE.local.md
 .github/copilot-instructions.md
 .vscode/
 .idea/
+
+# Local client project copies built for testing — never published
+kat-*/

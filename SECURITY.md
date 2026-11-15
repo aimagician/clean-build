@@ -22,8 +22,9 @@ and how to report a vulnerability.
 
 - A container escape via a kernel or Incus vulnerability. clean-builder relies
   on Incus/kernel isolation; it is not a hardened sandbox against 0-day escapes.
-- The `provision` (dependency install) phase, which runs online **by design**.
-  Its network activity is logged, not blocked — review the install logs.
+- The download step of `provision`, which runs online **by design**: what the
+  registry serves is logged, not blocked. Lifecycle scripts run afterwards in
+  an offline phase, unless you set `CB_ONLINE_SCRIPTS=1`.
 - Exfiltration through a `proxy` device you added for `watch` — a host-mediated
   tunnel that bypasses the bridge ACL by design. Remove it when you are done.
 - The build reading secrets that you placed in the mounted project directory.

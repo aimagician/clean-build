@@ -145,7 +145,8 @@ full host path; builder-level work like the toolchain install goes to
 
 | file | contents |
 |---|---|
-| `install-<stamp>.log` | full install transcript |
+| `install-<stamp>.log` | online download transcript (lifecycle scripts off) |
+| `install-scripts-<stamp>.log` | the lifecycle scripts, run offline |
 | `<script>-<stamp>.log` | offline build/test transcript for that script |
 | `egress-<phase>-<stamp>.log` | every packet that left during that phase |
 | `net-<phase>-<stamp>.log` | **who** tried to connect: per-process report of every network syscall (strace), naming the exact command behind each attempt |
@@ -355,9 +356,14 @@ Known limitations:
   uses them by design — while a proxy device exists, a `watch` phase has a
   network path the egress log won't show. Remove it (`proxy remove <port>`)
   when you're done.
-- **`provision` runs online by design.** Lifecycle scripts execute with the
-  network open (logged). The offline guarantee covers `build`/`watch`, not
-  dependency installation — review the install egress/transcript.
+- **`provision` downloads online, then runs scripts offline.** The online
+  window installs with lifecycle scripts disabled (`--ignore-scripts`, yarn
+  `--mode=skip-build`); the packages' and the project's install hooks then run
+  in a separate offline, traced `install-scripts` phase, where a phone-home is
+  blocked, not just logged. A script that genuinely needs the network (a
+  prebuilt-binary download, node-gyp fetching headers) fails there and names
+  itself; `CB_ONLINE_SCRIPTS=1` runs scripts online for that install, as
+  before. The download itself is still online — review the install egress.
 - **The AI verdict is advisory.** It reads attacker-influenced text; the
   rubric treats logs as untrusted, but trust the raw egress log over the
   model's summary.

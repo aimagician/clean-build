@@ -418,7 +418,29 @@ $(printf '%s\n' "$problems" | sed 's/^/         - /')
 
 # ------------------------------------------------------------- egress log --
 EGRESS_MARK=0
-egress_entries() { dmesg 2>/dev/null | grep -F "${NETWORK}-" || true; }
+# Which kernel-log lines are evidence about the container. The ACL logs both
+# directions with a "${NETWORK}-egress[-N]" or "${NETWORK}-ingress[-N]" prefix,
+# and the host's own broadcasts onto the bridge (mDNS to 224.0.0.251:5353,
+# SSDP to 239.255.255.250:1900, SRC=$GATEWAY, IN= empty, OUT=$NETWORK) hit the
+# ingress default-reject too, so they land in every capture as noise.
+# Reads dmesg lines on stdin, prints the ones to keep. Used for both the mark
+# and the capture, so the line-count window stays consistent.
+#
+# Keep every ACL line except the host's own multicast (SRC=gateway, DST in
+# 224.0.0.0/4). Everything from the container stays, rejected inbound traffic
+# stays too (a probe of the container is worth seeing), and so does any
+# gateway line that isn't multicast. awk exits 0 when nothing matches.
+egress_filter() {
+  awk -v tag="${NETWORK}-" -v gw="SRC=${GATEWAY} " '
+    index($0, tag) == 0 { next }
+    index($0, gw) && match($0, /DST=[0-9]+\./) {
+      first = substr($0, RSTART + 4, RLENGTH - 5) + 0
+      if (first >= 224 && first <= 239) next
+    }
+    { print }
+  '
+}
+egress_entries() { dmesg 2>/dev/null | egress_filter; }
 mark_egress() { assert_dmesg_readable; EGRESS_MARK="$(egress_entries | wc -l)"; }
 
 capture_egress() {
@@ -733,22 +755,66 @@ provision() {
   acl_open
   trap 'exit' INT TERM
   trap 'acl_lockdown || true; end_phase install' EXIT
+  # Online window: download and unpack only. Lifecycle scripts (the packages'
+  # and the project's own) are code the packages ship, so they run in the
+  # offline install-scripts phase below, where a phone-home is blocked rather
+  # than just logged. CB_ONLINE_SCRIPTS=1 runs them here, online, as before.
+  local online_scripts="${CB_ONLINE_SCRIPTS:-0}" no_scripts="--ignore-scripts" yarn_mode="--mode=skip-build"
+  [ "$online_scripts" = 1 ] && { no_scripts=""; yarn_mode=""; \
+    echo "▲ CB_ONLINE_SCRIPTS=1: lifecycle scripts run WITH internet this time"; }
   local cmd
   case "$pm" in
     pnpm) cmd='cd /work/project && corepack enable --install-directory /home/builder/.local/bin 2>/dev/null; export PATH=/home/builder/.local/bin:$PATH
        corepack prepare pnpm@latest --activate 2>/dev/null || true
-       CI=true corepack pnpm install --frozen-lockfile' ;;
+       CI=true corepack pnpm install --frozen-lockfile '"$no_scripts" ;;
     yarn) cmd='cd /work/project && corepack prepare yarn@stable --activate 2>/dev/null || true
-       CI=true corepack yarn install --immutable' ;;
+       CI=true corepack yarn install --immutable '"$yarn_mode" ;;
     npm)  cmd='cd /work/project
        [ -f package-lock.json ] || npm install --package-lock-only --ignore-scripts --no-audit --no-fund
-       npm ci --no-audit --no-fund' ;;
+       npm ci --no-audit --no-fund '"$no_scripts" ;;
   esac
   run_traced 1 install "$cmd" 2>&1 | tee "$file"
   trap - EXIT INT TERM
   acl_lockdown || true
-  end_phase install
-  echo "✓ install finished — builder is offline again"
+  finish_phase install
+  echo "✓ download finished — builder is offline again"
+  local rc=0
+  [ "$online_scripts" = 1 ] || install_scripts "$pm" || rc=$?
+  stop_instance
+  return "$rc"
+}
+
+# The lifecycle scripts the online window skipped, run offline and traced like
+# a build: dependencies' (pre|post)install hooks via the manager's rebuild, then
+# the project's own install hooks. A script that needs the network (prebuilt
+# binary downloads, node-gyp fetching headers) now fails here, visibly, instead
+# of quietly reaching the internet; that package is the one to look at.
+install_scripts() { # <package manager>
+  local pm="$1" dir file
+  assert_lockdown
+  dir="$(log_dir)"; file="$dir/install-scripts-$(stamp).log"
+  echo "▶ running lifecycle scripts OFFLINE — transcript → $(rel "$file")"
+  local rebuild run
+  case "$pm" in
+    pnpm) rebuild='export PATH=/home/builder/.local/bin:$PATH; corepack pnpm rebuild'; run='corepack pnpm run' ;;
+    yarn) rebuild='corepack yarn rebuild'; run='corepack yarn run' ;;
+    npm)  rebuild='npm rebuild'; run='npm run' ;;
+  esac
+  # Root hooks in npm's install order; a script the project lacks is skipped.
+  local root_hooks='for s in preinstall install postinstall prepare; do
+      node -e "process.exit(require(\"./package.json\").scripts?.[process.argv[1]] ? 0 : 1)" "$s" || continue
+      echo "> root $s"; '"$run"' "$s" || exit 1
+    done'
+  mark_egress
+  trap 'exit' INT TERM
+  trap 'finish_phase install-scripts' EXIT
+  local rc=0
+  run_traced 0 install-scripts "cd /work/project && $rebuild && $root_hooks" 2>&1 | tee "$file" || rc=$?
+  trap - EXIT INT TERM
+  finish_phase install-scripts
+  [ "$rc" = 0 ] && echo "✓ lifecycle scripts finished (offline)" \
+    || echo "▲ a lifecycle script failed offline — see $(rel "$file"); if it only fetches a prebuilt binary, decide whether to trust it (CB_ONLINE_SCRIPTS=1)" >&2
+  return "$rc"
 }
 
 pm_run() { # <script> — run a package.json script with the right manager
