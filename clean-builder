@@ -423,8 +423,7 @@ EGRESS_MARK=0
 # and the host's own broadcasts onto the bridge (mDNS to 224.0.0.251:5353,
 # SSDP to 239.255.255.250:1900, SRC=$GATEWAY, IN= empty, OUT=$NETWORK) hit the
 # ingress default-reject too, so they land in every capture as noise.
-# Reads dmesg lines on stdin, prints the ones to keep. Used for both the mark
-# and the capture, so the line-count window stays consistent.
+# Reads dmesg lines on stdin, prints the ones to keep.
 #
 # Keep every ACL line except the host's own multicast (SRC=gateway, DST in
 # 224.0.0.0/4). Everything from the container stays, rejected inbound traffic
@@ -441,32 +440,53 @@ egress_filter() {
   '
 }
 egress_entries() { dmesg 2>/dev/null | egress_filter; }
-mark_egress() { assert_dmesg_readable; EGRESS_MARK="$(egress_entries | wc -l)"; }
+
+# The phase window is marked by kernel timestamp, not by line count. Once the
+# ring buffer is full, old lines drop out as new ones arrive, so a count can
+# stay level while new packets come in, and `tail` past the old count would
+# print none of them. A timestamp only grows (until a reboot), however the
+# buffer wraps. dmesg_ts prints the seconds of each line's "[  1234.567890]".
+dmesg_ts() { sed -nE 's/^\[ *([0-9]+\.[0-9]+)\].*/\1/p'; }
+mark_egress() {
+  assert_dmesg_readable
+  EGRESS_MARK="$(dmesg 2>/dev/null | dmesg_ts | tail -n 1)"
+  EGRESS_MARK="${EGRESS_MARK:-0}"
+}
 
 capture_egress() {
   local label="$1" dir="${2:-$(log_dir)}"
   mkdir -p "$dir"
   local file="$dir/egress-$label-$(stamp).log"
-  local now; now="$(egress_entries | wc -l)"
+  local all oldest newest gap="" since="$EGRESS_MARK"
+  all="$(dmesg 2>/dev/null || true)"
+  oldest="$(printf '%s\n' "$all" | dmesg_ts | head -n 1)"; oldest="${oldest:-0}"
+  newest="$(printf '%s\n' "$all" | dmesg_ts | tail -n 1)"; newest="${newest:-0}"
+  # newest < mark: the host rebooted during the phase (timestamps restart), so
+  # every current line is from this phase or later: take them all.
+  # oldest > mark: the buffer wrapped past the phase start and its first lines
+  # are gone. Either way the capture can't be complete; say so, never hide it.
+  if awk -v n="$newest" -v m="$EGRESS_MARK" 'BEGIN { exit !(n + 0 < m + 0) }'; then
+    gap="kernel timestamps went backwards (${EGRESS_MARK}→${newest}s): the host rebooted during this phase"
+    since=-1
+  elif awk -v o="$oldest" -v m="$EGRESS_MARK" 'BEGIN { exit !(m + 0 > 0 && o + 0 > m + 0) }'; then
+    gap="kernel ring buffer wrapped: lines from ${EGRESS_MARK}s to ${oldest}s are gone"
+  fi
   {
     echo "# Egress packets during '$label' (host kernel log, ACL $ACL)"
     echo "# '${NETWORK}-egress' without a rule number = default REJECT (nothing should appear during offline phases)"
-    if [ "$now" -lt "$EGRESS_MARK" ]; then
-      # The kernel ring buffer wrapped since the phase started, so the line-count
-      # window is invalid. Over-report (dump every current line) rather than
-      # silently drop evidence, and flag it loudly — never let a breach look clean.
-      echo "# WARNING: kernel ring buffer shrank during this phase (${EGRESS_MARK}→${now} lines)."
-      echo "#          Showing ALL current ${NETWORK}- lines; may include earlier phases or have lost some."
-      egress_entries
-    else
-      egress_entries | tail -n +"$((EGRESS_MARK + 1))"
-    fi
+    echo "# window: kernel time > ${since}s"
+    [ -z "$gap" ] || echo "# WARNING: $gap. This capture may be missing packets."
+    printf '%s\n' "$all" | egress_filter | awk -v m="$since" '
+      match($0, /^\[ *[0-9]+\.[0-9]+\]/) {
+        t = substr($0, RSTART + 1, RLENGTH - 2); sub(/^ +/, "", t)
+        if (t + 0 > m + 0) print
+      }'
   } > "$file"
   # count real packet lines only — exclude the '#' header/warning lines, which
   # themselves mention "${NETWORK}-egress" and would otherwise be miscounted.
   local count; count="$(grep -F "${NETWORK}-" "$file" 2>/dev/null | grep -cv '^#' || true)"
   echo "▶ egress log: $(rel "$file")  (${count:-0} packets)"
-  [ "$now" -lt "$EGRESS_MARK" ] && echo "▲ egress capture for '$label' may be incomplete — kernel log wrapped; review it by hand" >&2 || true
+  [ -z "$gap" ] || echo "▲ egress capture for '$label' may be incomplete — $gap; review it by hand, and consider a larger kernel log (log_buf_len=)" >&2
 }
 
 # -------------------------------------------------- output integrity (L1+L2) --
@@ -544,10 +564,15 @@ analyze_changeset() { # <label> <pre-snapshot> <report-md> → echo "VERDICT|une
 
   # node_modules (pruned from the hash snapshot) must not change during an offline
   # build except caches — best-effort mtime tripwire (a build could backdate it).
+  # SvelteKit 3 also writes its generated tsconfig and app types to the
+  # top-level node_modules/$app/ on every sync; only those file types are
+  # exempt there, so a .js dropped into $app/ still counts.
   local nm_changed=0
   if [ -d "$PROJECT/node_modules" ]; then
     nm_changed="$(find "$PROJECT/node_modules" -newer "$pre" -type f \
-      -not -path '*/.vite/*' -not -path '*/.cache/*' -not -name '.package-lock.json' 2>/dev/null | wc -l)"
+      -not -path '*/.vite/*' -not -path '*/.cache/*' -not -name '.package-lock.json' \
+      -not \( -path "$PROJECT/node_modules/\$app/*" \( -name '*.json' -o -name '*.d.ts' \) \) \
+      2>/dev/null | wc -l)"
     nm_changed="${nm_changed:-0}"
   fi
 

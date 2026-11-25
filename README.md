@@ -148,7 +148,7 @@ full host path; builder-level work like the toolchain install goes to
 | `install-<stamp>.log` | online download transcript (lifecycle scripts off) |
 | `install-scripts-<stamp>.log` | the lifecycle scripts, run offline |
 | `<script>-<stamp>.log` | offline build/test transcript for that script |
-| `egress-<phase>-<stamp>.log` | every packet that left during that phase |
+| `egress-<phase>-<stamp>.log` | every packet that left during that phase (windowed by kernel timestamp; a `# WARNING` line means the kernel log wrapped or the host rebooted mid-phase, so packets may be missing) |
 | `net-<phase>-<stamp>.log` | **who** tried to connect: per-process report of every network syscall (strace), naming the exact command behind each attempt |
 | `analysis-<stamp>.md` | saved AI verdicts |
 | `outputs` | the project's own output paths, if it has any (`./clean-builder outputs`) |
@@ -237,7 +237,8 @@ output — look first.)
 > and the common exfil/drainer patterns. It does **not** catch a deterministic
 > payload written only into `dist/` that matches a baseline you don't have yet,
 > and the `node_modules` tripwire is mtime-based (a build could backdate to
-> evade it). Treat it as a strong tripwire, not a proof — pin/audit deps and
+> evade it). SvelteKit's generated `node_modules/$app/*.json` and `*.d.ts`
+> are exempt from it; anything else written there still counts. Treat it as a strong tripwire, not a proof — pin/audit deps and
 > diff output against a trusted CI build for the rest.
 
 ## AI analysis

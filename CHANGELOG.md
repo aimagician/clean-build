@@ -6,6 +6,22 @@ follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Changed
+
+- `provision` downloads with lifecycle scripts disabled, then runs them in a
+  separate offline, traced `install-scripts` phase. `CB_ONLINE_SCRIPTS=1`
+  runs them online for one install, as before.
+- Egress captures are windowed by kernel timestamp instead of line count. A
+  full ring buffer could keep the count level while new packets arrived, so
+  they were never printed. A capture now warns when the buffer wrapped past
+  the phase start or the host rebooted, instead of dumping every old line.
+
+### Fixed
+
+- The host's own mDNS/SSDP multicast no longer appears in egress captures.
+- SvelteKit 3's generated `node_modules/$app/*.json` and `*.d.ts` no longer
+  turn every build's verdict into ISSUE.
+
 ## [0.1.0] - 2026-10-16
 
 First public release.
